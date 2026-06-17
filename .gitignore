@@ -1,0 +1,41 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Android Studio
+*.hprof
+.idea/modules.xml
+.idea/workspace.xml
+.idea/libraries
+.idea/caches
+.idea/planningMode.xml
+
+# Key Store
+*.jks
+*.keystore
+*.p12
+*.key
+
+# Google Services
+google-services.json
+
+# Build artifacts
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Local config
+secrets.xml
