@@ -74,4 +74,10 @@ interface StatusHistoryDao {
         )
     """)
     suspend fun deleteLatestGroupPostedSince(since: Long)
+
+    @Query("UPDATE status_history SET photoFilePath = :newPrefix || SUBSTR(photoFilePath, LENGTH(:oldPrefix) + 1) WHERE photoFilePath LIKE :oldPrefix || '%'")
+    suspend fun replaceFilePathPrefix(oldPrefix: String, newPrefix: String)
+
+    @Query("UPDATE status_history SET photoFilePath = :newPath WHERE photoFilePath = :oldPath")
+    suspend fun updatePath(oldPath: String, newPath: String)
 }
