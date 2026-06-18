@@ -92,6 +92,7 @@ import android.content.ComponentName
 import androidx.core.content.FileProvider
 import android.provider.Settings
 import android.text.TextUtils
+import android.widget.Toast
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -684,6 +685,59 @@ class PhotoViewModel(
             }
         }
     }
+
+    // --- パス修復（機種変更対応）ロジック ---
+    fun autoRepairPaths(onComplete: (Int) -> Unit) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val allDbPhotos = photoDao.getAllPhotosOnce()
+            val currentLocalPaths = localPhotos.map { it.filePath }.toSet()
+            
+            val orphanedPhotos = allDbPhotos.filter { it.filePath !in currentLocalPaths }
+            if (orphanedPhotos.isEmpty()) {
+                withContext(Dispatchers.Main) { onComplete(0) }
+                return@launch
+            }
+
+            val localByName = localPhotos.groupBy { it.filePath.substringAfterLast("/") }
+            val updatedPhotos = mutableListOf<PhotoEntity>()
+            val pathMapping = mutableMapOf<String, String>()
+
+            orphanedPhotos.forEach { dbPhoto ->
+                val fileName = dbPhoto.filePath.substringAfterLast("/")
+                val matches = localByName[fileName]
+                if (matches != null && matches.size == 1) {
+                    val newPath = matches[0].filePath
+                    updatedPhotos.add(dbPhoto.copy(filePath = newPath))
+                    pathMapping[dbPhoto.filePath] = newPath
+                }
+            }
+
+            if (updatedPhotos.isNotEmpty()) {
+                photoDao.updatePhotos(updatedPhotos)
+                
+                // 2. 履歴テーブルのパスも個別更新
+                pathMapping.forEach { (oldPath, newPath) ->
+                    historyDao.updatePath(oldPath, newPath)
+                }
+
+                // 3. 念のため共通プレフィックスの一括置換も試みる（マッピング漏れ対策）
+                try {
+                    val firstMapping = pathMapping.entries.first()
+                    val oldPrefix = firstMapping.key.substringBeforeLast("/")
+                    val newPrefix = firstMapping.value.substringBeforeLast("/")
+                    
+                    if (oldPrefix.isNotEmpty() && oldPrefix != newPrefix) {
+                        photoDao.replaceFilePathPrefix(oldPrefix, newPrefix)
+                        historyDao.replaceFilePathPrefix(oldPrefix, newPrefix)
+                    }
+                } catch (e: Exception) {}
+            }
+            
+            withContext(Dispatchers.Main) {
+                onComplete(updatedPhotos.size)
+            }
+        }
+    }
 }
 
 class PhotoViewModelFactory(
@@ -760,9 +814,9 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
     var apertureMenuExpanded by remember { mutableStateOf(false) }
     var isExifFilterExpanded by remember { mutableStateOf(false) }
     var selectedPhotoIndex by remember { mutableStateOf<Int?>(null) }
-    var selectedUris by remember { mutableStateOf(setOf<Uri>()) } // 🚀 複数選択用
+    var selectedUris by remember { mutableStateOf(setOf<Uri>()) } // 複数選択用
 
-    // 🟢 追加：OSによってViewModelが初期化された場合でも、DBから写真が読み込まれた瞬間に未確認リストを復元する
+    // 追加：OSによってViewModelが初期化された場合でも、DBから写真が読み込まれた瞬間に未確認リストを復元する
     LaunchedEffect(photos) {
         if (photos.isNotEmpty()) {
             viewModel.restorePendingPhotos(photos)
@@ -785,6 +839,67 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
         ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let { viewModel.setMakeFilterFromUri(context, it) }
+    }
+
+    var showRestoreSuccessDialog by remember { mutableStateOf(false) }
+
+    val backupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip")
+    ) { uri ->
+        uri?.let {
+            scope.launch(Dispatchers.IO) {
+                val os = context.contentResolver.openOutputStream(it)
+                if (os != null) {
+                    val success = DatabaseBackupManager(context).backupDatabase(os)
+                    withContext(Dispatchers.Main) {
+                        if (success) {
+                            Toast.makeText(context, "バックアップが完了しました", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(context, "バックアップに失敗しました", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    val restoreLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let {
+            scope.launch(Dispatchers.IO) {
+                val `is` = context.contentResolver.openInputStream(it)
+                if (`is` != null) {
+                    val success = DatabaseBackupManager(context).restoreDatabase(`is`)
+                    withContext(Dispatchers.Main) {
+                        if (success) {
+                            showRestoreSuccessDialog = true
+                        } else {
+                            Toast.makeText(context, "復元に失敗しました", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showRestoreSuccessDialog) {
+        AlertDialog(
+            onDismissRequest = { },
+            title = { Text("復元完了") },
+            text = { Text("データベースの復元が完了しました。設定を反映させるためアプリを再起動します。") },
+            confirmButton = {
+                Button(onClick = {
+                    val intent = Intent(context, MainActivity::class.java)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                    context.startActivity(intent)
+                    Runtime.getRuntime().exit(0)
+                }) {
+                    Text("再起動")
+                }
+            },
+            dismissButton = null
+        )
     }
 
     // 戻る操作の統合管理（詳細画面・複数選択）
@@ -1105,12 +1220,14 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                     onSelectMakeReference = { 
                         viewModel.isSelectingMakeReference = true
                         currentTab = 0 // Galleryタブへ移動
-                    }
+                    },
+                    onBackup = { backupLauncher.launch("KamekoPad_Backup_${SimpleDateFormat("yyyyMMdd_HHmm", Locale.getDefault()).format(Date())}.zip") },
+                    onRestore = { restoreLauncher.launch(arrayOf("application/zip")) }
                 )
                 else -> {
                     // --- 従来のギャラリー表示 ---
                     Column(modifier = Modifier.fillMaxSize()) {
-                        // 🚀 機材選択モード中のバナー
+                        // 機材選択モード中のバナー
                         if (viewModel.isSelectingMakeReference) {
                             Surface(
                                 modifier = Modifier.fillMaxWidth(),
@@ -1133,7 +1250,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                             }
                         }
 
-                        // 🚀 複数選択中の上部バー
+                        // 複数選択中の上部バー
                         if (selectedUris.isNotEmpty()) {
                             Surface(
                                 modifier = Modifier.fillMaxWidth(),
@@ -1185,7 +1302,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
 
                                     Spacer(modifier = Modifier.width(4.dp))
 
-                                    // 🚀 X (Twitter) 直接共有
+                                    // X (Twitter) 直接共有
                                     IconButton(
                                         onClick = {
                                             val uris = selectedUris.toList()
@@ -1214,7 +1331,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                         Text("X", fontWeight = FontWeight.Black, fontSize = 16.sp)
                                     }
 
-                                    // 🚀 Lightroom 直接共有
+                                    // Lightroom 直接共有
                                     IconButton(
                                         onClick = {
                                             val uris = selectedUris.toList()
@@ -1245,13 +1362,13 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                 }
                             }
                         } else {
-                            // 🚀 ① 上部バー (カウンターと検索・更新ボタン)
+                            // ① 上部バー (カウンターと検索・更新ボタン)
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                // 🚀 24時間投稿数カウンター (Activity Chip スタイル)
+                                // 24時間投稿数カウンター (Activity Chip スタイル)
                                 val postStats by viewModel.postStatsLast24h.collectAsState()
                                 val isActive = postStats.photoCount > 0
 
@@ -1290,7 +1407,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
 
                                 Spacer(modifier = Modifier.weight(1f))
 
-                                // 🚀 検索ボタン (トグル)
+                                // 検索ボタン (トグル)
                                 IconButton(
                                     onClick = { isSearchExpanded = !isSearchExpanded },
                                     modifier = Modifier.size(32.dp)
@@ -1303,7 +1420,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     )
                                 }
 
-                                // 🚀 手動更新ボタン
+                                // 手動更新ボタン
                                 IconButton(
                                     onClick = { refreshPhotos(true) },
                                     modifier = Modifier.size(32.dp)
@@ -1318,7 +1435,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                             }
                         }
 
-                        // --- 🚀 モダン検索＆フィルタパネル ---
+                        // --- モダン検索＆フィルタパネル ---
                         Column(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
                             verticalArrangement = Arrangement.spacedBy(2.dp)
@@ -1430,7 +1547,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     }
                                 }
 
-                                // --- 🚀 並び替え集約ボタン ---
+                                // --- 並び替え集約ボタン ---
                                 Box {
                                     val sortLabel = when (viewModel.selectedSortType) {
                                         PhotoSortType.DATE_ADDED -> "追加順"
@@ -1472,7 +1589,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     }
                                 }
 
-                                // --- 🚀 BODY（機材）集約ボタン ---
+                                // --- BODY（機材）集約ボタン ---
                                 Box {
                                     val bodyLabel = if (viewModel.selectedMakeFilter == null) "BODY" else viewModel.selectedMakeFilter!!
                                     FilterChip(
@@ -1502,7 +1619,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                             }
                                         )
                                         
-                                        // 🚀 選択中の機材のみを表示
+                                        // 選択中の機材のみを表示
                                         viewModel.selectedMakeFilter?.let { body ->
                                             DropdownMenuItem(
                                                 text = { Text(text = body.uppercase(), fontSize = 12.sp) },
@@ -1526,7 +1643,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     }
                                 }
 
-                                // --- 🚀 EXIF詳細フィルタの展開ボタン ---
+                                // --- EXIF詳細フィルタの展開ボタン ---
                                 val isExifActive = viewModel.selectedIsoFilter != null || viewModel.selectedFocalFilter != null || 
                                                  viewModel.selectedSsFilter != null || viewModel.selectedApertureFilter != null
                                 FilterChip(
@@ -1539,7 +1656,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                 )
                             }
 
-                            // 🚀 展開される撮影設定フィルタ行（ISO, Focal, SS, Aperture）
+                            // 展開される撮影設定フィルタ行（ISO, Focal, SS, Aperture）
                             androidx.compose.animation.AnimatedVisibility(visible = isExifFilterExpanded) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 4.dp),
@@ -1814,7 +1931,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
         }
     }
 
-    // --- 🚀 現場登録ダイアログ ---
+    // --- 現場登録ダイアログ ---
     if (showEventDialog) {
         AlertDialog(
             onDismissRequest = { 
@@ -2008,7 +2125,7 @@ fun ModernDashboardScreen(viewModel: PhotoViewModel) {
             )
         )
 
-        // 🟢 24h / 全期間 切り替え
+        // 24h / 全期間 切り替え
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.End
@@ -2186,7 +2303,7 @@ fun ModernTimelineScreen(
             
             Spacer(modifier = Modifier.weight(1f))
             
-            // 🚀 ヘッダー右側にひっそりと配置
+            // ヘッダー右側にひっそりと配置
             IconButton(onClick = { onShowEventDialog(true) }) {
                 Icon(Icons.Default.Add, contentDescription = "現場追加", tint = Color.Gray)
             }
@@ -2340,8 +2457,11 @@ fun ModernTimelineScreen(
 fun ModernSettingScreen(
     viewModel: PhotoViewModel, 
     onManageEvents: () -> Unit,
-    onSelectMakeReference: () -> Unit
+    onSelectMakeReference: () -> Unit,
+    onBackup: () -> Unit,
+    onRestore: () -> Unit
 ) {
+    val context = LocalContext.current
     var showResetConfirm by remember { mutableStateOf(false) }
 
     if (showResetConfirm) {
@@ -2508,6 +2628,112 @@ fun ModernSettingScreen(
                     Icon(Icons.AutoMirrored.Filled.List, null, tint = MaterialTheme.colorScheme.onSurface)
                     Spacer(Modifier.width(16.dp))
                     Text("現場（イベント）の管理・一括登録", fontSize = 15.sp)
+                }
+                Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.Gray)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // バックアップ
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onBackup() },
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(16.dp),
+            tonalElevation = 2.dp
+        ) {
+            Row(
+                modifier = Modifier.padding(20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Share, null, tint = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.width(16.dp))
+                    Column {
+                        Text("データベースのバックアップ", fontSize = 15.sp)
+                        Text("現在の情報をZIPファイルとして保存します", fontSize = 12.sp, color = Color.Gray)
+                    }
+                }
+                Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.Gray)
+            }
+        }
+
+        // 復元
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onRestore() },
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(16.dp),
+            tonalElevation = 2.dp
+        ) {
+            Row(
+                modifier = Modifier.padding(20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Refresh, null, tint = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.width(16.dp))
+                    Column {
+                        Text("バックアップから復元", fontSize = 15.sp)
+                        Text("以前保存したZIPファイルから情報を復元します", fontSize = 12.sp, color = Color.Gray)
+                    }
+                }
+                Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.Gray)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // パス修復ツール（機種変更サポート）
+        var showRepairConfirm by remember { mutableStateOf(false) }
+        if (showRepairConfirm) {
+            AlertDialog(
+                onDismissRequest = { showRepairConfirm = false },
+                title = { Text("写真パスの一括修復") },
+                text = { Text("機種変更などで写真の保存場所が変わった場合、ファイル名をもとにデータベースの情報を再紐付けします。実行しますか？") },
+                confirmButton = {
+                    Button(onClick = {
+                        viewModel.autoRepairPaths { count ->
+                            Toast.makeText(context, "${count}枚の写真を再紐付けしました", Toast.LENGTH_LONG).show()
+                        }
+                        showRepairConfirm = false
+                    }) {
+                        Text("実行する")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showRepairConfirm = false }) {
+                        Text("キャンセル")
+                    }
+                }
+            )
+        }
+
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { showRepairConfirm = true },
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(16.dp),
+            tonalElevation = 2.dp
+        ) {
+            Row(
+                modifier = Modifier.padding(20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Build, null, tint = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.width(16.dp))
+                    Column {
+                        Text("写真パスの修復 (機種変更対応)", fontSize = 15.sp)
+                        Text("不整合なパスをファイル名で再紐付けします", fontSize = 12.sp, color = Color.Gray)
+                    }
                 }
                 Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.Gray)
             }
@@ -3623,7 +3849,7 @@ suspend fun prepareShareUri(context: Context, filePath: String, mediaStoreUri: U
         }
         
         if (tempFile.exists() && tempFile.length() > 0) {
-            return@withContext FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", tempFile)
+            return@withContext FileProvider.getUriForFile(context, context.packageName + ".fileprovider", tempFile)
         }
     } catch (e: Exception) {
         Log.e("KamekoPad", "Failed to proxy URI to cache: $sourceUri", e)
@@ -3632,7 +3858,7 @@ suspend fun prepareShareUri(context: Context, filePath: String, mediaStoreUri: U
     // 失敗時のフォールバック
     return@withContext try {
         val file = File(filePath)
-        if (file.exists()) FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        if (file.exists()) FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
         else sourceUri
     } catch (e: Exception) {
         sourceUri

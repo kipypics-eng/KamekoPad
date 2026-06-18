@@ -102,7 +102,7 @@ class XPostAccessibilityService : AccessibilityService() {
         }
     }
 
-    // 🚀 直近5分以内に作成・更新された写真を取得する
+    // 直近5分以内に作成・更新された写真を取得する
     private fun getRecentPhotosFromMediaStore(): List<String> {
         val paths = mutableListOf<String>()
         val fiveMinutesAgo = (System.currentTimeMillis() / 1000L) - (5 * 60)

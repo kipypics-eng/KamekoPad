@@ -37,4 +37,14 @@ interface PhotoDao {
 
     @Query("UPDATE photos SET cameraMake = NULL WHERE cameraMake = :make")
     suspend fun clearCameraMake(make: String)
+
+    /**
+     * 指定した接頭辞を新しい接頭辞に一括置換します。
+     * SQLiteのreplace関数を使用し、パスの不整合を修正します。
+     */
+    @Query("UPDATE photos SET filePath = :newPrefix || SUBSTR(filePath, LENGTH(:oldPrefix) + 1) WHERE filePath LIKE :oldPrefix || '%'")
+    suspend fun replaceFilePathPrefix(oldPrefix: String, newPrefix: String)
+
+    @Query("SELECT * FROM photos WHERE filePath NOT IN (:currentPaths)")
+    suspend fun getOrphanedPhotos(currentPaths: List<String>): List<PhotoEntity>
 }
