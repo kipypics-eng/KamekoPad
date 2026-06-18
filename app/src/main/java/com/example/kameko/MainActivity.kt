@@ -686,7 +686,7 @@ class PhotoViewModel(
         }
     }
 
-    // --- 🚀 パス修復（機種変更対応）ロジック ---
+    // --- パス修復（機種変更対応）ロジック ---
     fun autoRepairPaths(onComplete: (Int) -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             val allDbPhotos = photoDao.getAllPhotosOnce()
@@ -814,9 +814,9 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
     var apertureMenuExpanded by remember { mutableStateOf(false) }
     var isExifFilterExpanded by remember { mutableStateOf(false) }
     var selectedPhotoIndex by remember { mutableStateOf<Int?>(null) }
-    var selectedUris by remember { mutableStateOf(setOf<Uri>()) } // 🚀 複数選択用
+    var selectedUris by remember { mutableStateOf(setOf<Uri>()) } // 複数選択用
 
-    // 🟢 追加：OSによってViewModelが初期化された場合でも、DBから写真が読み込まれた瞬間に未確認リストを復元する
+    // 追加：OSによってViewModelが初期化された場合でも、DBから写真が読み込まれた瞬間に未確認リストを復元する
     LaunchedEffect(photos) {
         if (photos.isNotEmpty()) {
             viewModel.restorePendingPhotos(photos)
@@ -1227,7 +1227,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                 else -> {
                     // --- 従来のギャラリー表示 ---
                     Column(modifier = Modifier.fillMaxSize()) {
-                        // 🚀 機材選択モード中のバナー
+                        // 機材選択モード中のバナー
                         if (viewModel.isSelectingMakeReference) {
                             Surface(
                                 modifier = Modifier.fillMaxWidth(),
@@ -1250,7 +1250,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                             }
                         }
 
-                        // 🚀 複数選択中の上部バー
+                        // 複数選択中の上部バー
                         if (selectedUris.isNotEmpty()) {
                             Surface(
                                 modifier = Modifier.fillMaxWidth(),
@@ -1302,7 +1302,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
 
                                     Spacer(modifier = Modifier.width(4.dp))
 
-                                    // 🚀 X (Twitter) 直接共有
+                                    // X (Twitter) 直接共有
                                     IconButton(
                                         onClick = {
                                             val uris = selectedUris.toList()
@@ -1331,7 +1331,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                         Text("X", fontWeight = FontWeight.Black, fontSize = 16.sp)
                                     }
 
-                                    // 🚀 Lightroom 直接共有
+                                    // Lightroom 直接共有
                                     IconButton(
                                         onClick = {
                                             val uris = selectedUris.toList()
@@ -1362,13 +1362,13 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                 }
                             }
                         } else {
-                            // 🚀 ① 上部バー (カウンターと検索・更新ボタン)
+                            // ① 上部バー (カウンターと検索・更新ボタン)
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                // 🚀 24時間投稿数カウンター (Activity Chip スタイル)
+                                // 24時間投稿数カウンター (Activity Chip スタイル)
                                 val postStats by viewModel.postStatsLast24h.collectAsState()
                                 val isActive = postStats.photoCount > 0
 
@@ -1407,7 +1407,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
 
                                 Spacer(modifier = Modifier.weight(1f))
 
-                                // 🚀 検索ボタン (トグル)
+                                // 検索ボタン (トグル)
                                 IconButton(
                                     onClick = { isSearchExpanded = !isSearchExpanded },
                                     modifier = Modifier.size(32.dp)
@@ -1420,7 +1420,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     )
                                 }
 
-                                // 🚀 手動更新ボタン
+                                // 手動更新ボタン
                                 IconButton(
                                     onClick = { refreshPhotos(true) },
                                     modifier = Modifier.size(32.dp)
@@ -1435,7 +1435,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                             }
                         }
 
-                        // --- 🚀 モダン検索＆フィルタパネル ---
+                        // --- モダン検索＆フィルタパネル ---
                         Column(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
                             verticalArrangement = Arrangement.spacedBy(2.dp)
@@ -1547,7 +1547,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     }
                                 }
 
-                                // --- 🚀 並び替え集約ボタン ---
+                                // --- 並び替え集約ボタン ---
                                 Box {
                                     val sortLabel = when (viewModel.selectedSortType) {
                                         PhotoSortType.DATE_ADDED -> "追加順"
@@ -1589,7 +1589,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     }
                                 }
 
-                                // --- 🚀 BODY（機材）集約ボタン ---
+                                // --- BODY（機材）集約ボタン ---
                                 Box {
                                     val bodyLabel = if (viewModel.selectedMakeFilter == null) "BODY" else viewModel.selectedMakeFilter!!
                                     FilterChip(
@@ -1619,7 +1619,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                             }
                                         )
                                         
-                                        // 🚀 選択中の機材のみを表示
+                                        // 選択中の機材のみを表示
                                         viewModel.selectedMakeFilter?.let { body ->
                                             DropdownMenuItem(
                                                 text = { Text(text = body.uppercase(), fontSize = 12.sp) },
@@ -1643,7 +1643,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     }
                                 }
 
-                                // --- 🚀 EXIF詳細フィルタの展開ボタン ---
+                                // --- EXIF詳細フィルタの展開ボタン ---
                                 val isExifActive = viewModel.selectedIsoFilter != null || viewModel.selectedFocalFilter != null || 
                                                  viewModel.selectedSsFilter != null || viewModel.selectedApertureFilter != null
                                 FilterChip(
@@ -1656,7 +1656,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                 )
                             }
 
-                            // 🚀 展開される撮影設定フィルタ行（ISO, Focal, SS, Aperture）
+                            // 展開される撮影設定フィルタ行（ISO, Focal, SS, Aperture）
                             androidx.compose.animation.AnimatedVisibility(visible = isExifFilterExpanded) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 4.dp),
@@ -1931,7 +1931,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
         }
     }
 
-    // --- 🚀 現場登録ダイアログ ---
+    // --- 現場登録ダイアログ ---
     if (showEventDialog) {
         AlertDialog(
             onDismissRequest = { 
@@ -2125,7 +2125,7 @@ fun ModernDashboardScreen(viewModel: PhotoViewModel) {
             )
         )
 
-        // 🟢 24h / 全期間 切り替え
+        // 24h / 全期間 切り替え
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.End
@@ -2303,7 +2303,7 @@ fun ModernTimelineScreen(
             
             Spacer(modifier = Modifier.weight(1f))
             
-            // 🚀 ヘッダー右側にひっそりと配置
+            // ヘッダー右側にひっそりと配置
             IconButton(onClick = { onShowEventDialog(true) }) {
                 Icon(Icons.Default.Add, contentDescription = "現場追加", tint = Color.Gray)
             }
@@ -2635,7 +2635,7 @@ fun ModernSettingScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 🚀 バックアップ
+        // バックアップ
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -2661,7 +2661,7 @@ fun ModernSettingScreen(
             }
         }
 
-        // 🚀 復元
+        // 復元
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -2689,7 +2689,7 @@ fun ModernSettingScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 🚀 パス修復ツール（機種変更サポート）
+        // パス修復ツール（機種変更サポート）
         var showRepairConfirm by remember { mutableStateOf(false) }
         if (showRepairConfirm) {
             AlertDialog(
