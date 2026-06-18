@@ -1,5 +1,5 @@
 # KamekoPad
-Version 0.1.0
+Version 0.1.1
 
 KamekoPadは、イベントやライブ等での撮影向け写真管理・SNS投稿支援Androidアプリです。
 機材情報や撮影設定（EXIF）に基づいた整理を行い、SNSへのスムーズな投稿をサポートすることを目的としています。
