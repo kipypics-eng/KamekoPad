@@ -585,7 +585,10 @@ class PhotoViewModel(
 
     fun addEvent(event: EventEntity, currentPhotos: List<LocalPhotoItem>) {
         viewModelScope.launch(Dispatchers.IO) {
-            val newEventId = eventDao.insert(event)
+            // 重複チェック
+            val existing = eventDao.findEvent(event.name, event.venue, event.eventDate)
+            val eventId = existing?.id ?: eventDao.insert(event)
+
             if (event.startTime <= 0L) return@launch
 
             val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
@@ -597,10 +600,10 @@ class PhotoViewModel(
                     val existingDbPhoto = photoDao.getPhotoByPath(localPhoto.filePath)
                     if (existingDbPhoto != null) {
                         if (existingDbPhoto.eventId == null) {
-                            photoDao.updatePhoto(existingDbPhoto.copy(eventId = newEventId))
+                            photoDao.updatePhoto(existingDbPhoto.copy(eventId = eventId))
                         }
                     } else {
-                        photoDao.insertPhoto(PhotoEntity(filePath = localPhoto.filePath, fileType = localPhoto.fileType, status = PhotoStatus.SHOT.name, eventId = newEventId, memo = ""))
+                        photoDao.insertPhoto(PhotoEntity(filePath = localPhoto.filePath, fileType = localPhoto.fileType, status = PhotoStatus.SHOT.name, eventId = eventId, memo = ""))
                     }
                 }
             }
@@ -611,21 +614,69 @@ class PhotoViewModel(
         viewModelScope.launch(Dispatchers.IO) { eventDao.delete(event) }
     }
 
-    fun insertBulkEventsFromText(rawText: String) {
+    fun insertBulkEventsFromText(rawText: String, onComplete: ((Int) -> Unit)? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
             val blocks = rawText.split(Regex("\n\\s*\n"))
+            var count = 0
             for (block in blocks) {
                 val lines = block.lines().map { it.trim() }.filter { it.isNotEmpty() }
                 if (lines.size >= 3) {
                     val name = lines[0]
                     val venue = lines[1]
                     val dateStr = lines[2]
-                    val startTimeTimestamp = try { sdf.parse(dateStr)?.time ?: 0L } catch (e: Exception) { 0L }
-
-                    eventDao.insert(EventEntity(id = 0, name = name, venue = venue, eventDate = dateStr, startTime = startTimeTimestamp, endTime = 0L))
+                    
+                    // 重複チェック
+                    val existing = eventDao.findEvent(name, venue, dateStr)
+                    if (existing == null) {
+                        val startTimeTimestamp = try { sdf.parse(dateStr)?.time ?: 0L } catch (e: Exception) { 0L }
+                        eventDao.insert(EventEntity(id = 0, name = name, venue = venue, eventDate = dateStr, startTime = startTimeTimestamp, endTime = 0L))
+                        count++
+                    }
                 }
             }
+            withContext(Dispatchers.Main) {
+                onComplete?.invoke(count)
+            }
+        }
+    }
+
+    /**
+     * GitHubなどのURLからテキスト形式のイベントリストを取得してインポートする
+     */
+    fun importEventsFromUrl(url: String, onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                connection.requestMethod = "GET"
+                connection.connectTimeout = 10000
+                connection.readTimeout = 10000
+                
+                if (connection.responseCode == 200) {
+                    val text = connection.inputStream.bufferedReader().use { it.readText() }
+                    insertBulkEventsFromText(text) { count ->
+                        onResult(true, "${count}件の新規イベントを取り込みました")
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        onResult(false, "サーバーエラー: ${connection.responseCode}")
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    onResult(false, "通信失敗: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * 全イベントをテキスト形式（3行ブロック）で書き出す
+     */
+    fun exportEventsToText(): String {
+        val allEvents = events.value.sortedByDescending { it.startTime }
+        return allEvents.joinToString("\n\n") { event ->
+            "${event.name}\n${event.venue}\n${event.eventDate}"
         }
     }
 
@@ -2599,6 +2650,93 @@ fun ModernSettingScreen(
             Icon(Icons.Default.Delete, null, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(8.dp))
             Text("機材リストをリセット", fontSize = 12.sp)
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // --- 🌐 外部イベントインポート ---
+        Text(
+            text = "EXTERNAL EVENT IMPORT",
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 2.sp,
+            color = Color.Gray
+        )
+        var importUrl by remember { mutableStateOf("") }
+        var isImporting by remember { mutableStateOf(false) }
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(16.dp),
+            tonalElevation = 2.dp
+        ) {
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = importUrl,
+                    onValueChange = { importUrl = it },
+                    label = { Text("GitHub Raw URL (Text形式)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    placeholder = { Text("https://raw.githubusercontent.com/...", fontSize = 10.sp) },
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            if (importUrl.isNotBlank()) {
+                                isImporting = true
+                                viewModel.importEventsFromUrl(importUrl) { success, message ->
+                                    isImporting = false
+                                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                    if (success) importUrl = ""
+                                }
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = !isImporting && importUrl.isNotBlank()
+                    ) {
+                        if (isImporting) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color.White)
+                        } else {
+                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("インポート")
+                        }
+                    }
+                    
+                    OutlinedButton(
+                        onClick = {
+                            val text = viewModel.exportEventsToText()
+                            if (text.isBlank()) {
+                                Toast.makeText(context, "出力するイベントがありません", Toast.LENGTH_SHORT).show()
+                            } else {
+                                // クリップボードにコピー
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                val clip = android.content.ClipData.newPlainText("Events", text)
+                                clipboard.setPrimaryClip(clip)
+                                
+                                // 共有ダイアログも表示
+                                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_TEXT, text)
+                                }
+                                context.startActivity(Intent.createChooser(shareIntent, "イベントリストを出力"))
+                                
+                                Toast.makeText(context, "クリップボードにコピーしました", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Share, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("エクスポート")
+                    }
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
