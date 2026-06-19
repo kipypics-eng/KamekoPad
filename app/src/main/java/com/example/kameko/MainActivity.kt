@@ -670,6 +670,16 @@ class PhotoViewModel(
         }
     }
 
+    /**
+     * 全イベントをテキスト形式（3行ブロック）で書き出す
+     */
+    fun exportEventsToText(): String {
+        val allEvents = events.value.sortedByDescending { it.startTime }
+        return allEvents.joinToString("\n\n") { event ->
+            "${event.name}\n${event.venue}\n${event.eventDate}"
+        }
+    }
+
     val allPostedHistory = historyDao.getAllPostedHistory().stateIn(
         viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
     )
@@ -2671,26 +2681,59 @@ fun ModernSettingScreen(
                     placeholder = { Text("https://raw.githubusercontent.com/...", fontSize = 10.sp) },
                     textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp)
                 )
-                Button(
-                    onClick = {
-                        if (importUrl.isNotBlank()) {
-                            isImporting = true
-                            viewModel.importEventsFromUrl(importUrl) { success, message ->
-                                isImporting = false
-                                Toast.makeText(context, message, Toast.LENGTH_LONG).show()
-                                if (success) importUrl = ""
-                            }
-                        }
-                    },
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = !isImporting && importUrl.isNotBlank()
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    if (isImporting) {
-                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color.White)
-                    } else {
-                        Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                    Button(
+                        onClick = {
+                            if (importUrl.isNotBlank()) {
+                                isImporting = true
+                                viewModel.importEventsFromUrl(importUrl) { success, message ->
+                                    isImporting = false
+                                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                    if (success) importUrl = ""
+                                }
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = !isImporting && importUrl.isNotBlank()
+                    ) {
+                        if (isImporting) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color.White)
+                        } else {
+                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("インポート")
+                        }
+                    }
+                    
+                    OutlinedButton(
+                        onClick = {
+                            val text = viewModel.exportEventsToText()
+                            if (text.isBlank()) {
+                                Toast.makeText(context, "出力するイベントがありません", Toast.LENGTH_SHORT).show()
+                            } else {
+                                // クリップボードにコピー
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                val clip = android.content.ClipData.newPlainText("Events", text)
+                                clipboard.setPrimaryClip(clip)
+                                
+                                // 共有ダイアログも表示
+                                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_TEXT, text)
+                                }
+                                context.startActivity(Intent.createChooser(shareIntent, "イベントリストを出力"))
+                                
+                                Toast.makeText(context, "クリップボードにコピーしました", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Share, null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text("インポート実行")
+                        Text("エクスポート")
                     }
                 }
             }
