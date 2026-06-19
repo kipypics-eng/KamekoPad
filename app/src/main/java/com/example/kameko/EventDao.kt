@@ -20,6 +20,9 @@ interface EventDao {
     @Query("SELECT * FROM events")
     suspend fun getAllEventsOnce(): List<EventEntity>
 
+    @Query("SELECT * FROM events WHERE name = :name AND venue = :venue AND eventDate = :date LIMIT 1")
+    suspend fun findEvent(name: String, venue: String, date: String): EventEntity?
+
     @androidx.room.Delete
     suspend fun delete(event: EventEntity)
 }
