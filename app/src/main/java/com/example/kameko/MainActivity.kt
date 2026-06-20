@@ -885,6 +885,42 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
     val gridState = rememberLazyGridState()
     val scope = rememberCoroutineScope()
 
+    // 複数選択アクションの共通処理
+    val onMultiShare: (String?) -> Unit = { packageId ->
+        val uris = selectedUris.toList()
+        val selectedPhotoEntities = uris.mapNotNull { uri ->
+            val local = viewModel.localPhotos.find { it.uri == uri }
+            local?.let { dbPhotoMap[it.filePath] ?: PhotoEntity(filePath = it.filePath, fileType = it.fileType) }
+        }
+        
+        scope.launch(Dispatchers.IO) {
+            val shareableUris = uris.map { uri ->
+                val local = viewModel.localPhotos.find { it.uri == uri }
+                prepareShareUri(context, local?.filePath ?: "", uri)
+            }
+            if (shareableUris.isEmpty()) return@launch
+
+            withContext(Dispatchers.Main) {
+                shareToPackage(context, packageId, shareableUris, null) {
+                    viewModel.savePendingPhotos(selectedPhotoEntities)
+                    viewModel.shareActionStarted = true
+                    selectedUris = emptySet()
+                }
+            }
+        }
+    }
+
+    val onMultiPost: () -> Unit = {
+        val uris = selectedUris.toList()
+        val selectedPhotoEntities = uris.mapNotNull { uri ->
+            val local = viewModel.localPhotos.find { it.uri == uri }
+            local?.let { dbPhotoMap[it.filePath] ?: PhotoEntity(filePath = it.filePath, fileType = it.fileType) }
+        }
+        viewModel.savePendingPhotos(selectedPhotoEntities)
+        viewModel.showPostConfirmDialog = true
+        selectedUris = emptySet()
+    }
+
     // 機材フィルタ用：画像選択ランチャー
     val makePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
@@ -1195,52 +1231,91 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
 
     Scaffold(
         bottomBar = {
-            NavigationBar(
-                modifier = Modifier.height(88.dp),
-                containerColor = MaterialTheme.colorScheme.surface,
-                contentColor = MaterialTheme.colorScheme.onSurface,
-                tonalElevation = 0.dp
-            ) {
-                NavigationBarItem(
-                    selected = currentTab == 0,
-                    onClick = { currentTab = 0 },
-                    icon = { Icon(Icons.AutoMirrored.Filled.List, null, modifier = Modifier.size(24.dp)) },
-                    label = { Text("Gallery", fontSize = 11.sp, letterSpacing = 0.5.sp) },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = MaterialTheme.colorScheme.primary,
-                        indicatorColor = MaterialTheme.colorScheme.primaryContainer
+            if (selectedUris.isNotEmpty() && currentTab == 0) {
+                // 複数選択用アクションバー (案1: ボトムバー)
+                BottomAppBar(
+                    modifier = Modifier.height(88.dp),
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 8.dp,
+                    contentPadding = PaddingValues(0.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        SelectionActionButton(
+                            icon = Icons.Default.Share,
+                            label = "共有",
+                            onClick = { onMultiShare(null) }
+                        )
+                        SelectionActionButton(
+                            text = "X",
+                            label = "X Post",
+                            onClick = { onMultiShare("com.twitter.android") }
+                        )
+                        SelectionActionButton(
+                            text = "Lr",
+                            label = "Lightroom",
+                            textColor = Color(0xFF001E36),
+                            onClick = { onMultiShare("com.adobe.lrmobile") }
+                        )
+                        SelectionActionButton(
+                            icon = Icons.Default.CheckCircle,
+                            label = "POST済",
+                            iconColor = PostGreen,
+                            onClick = { onMultiPost() }
+                        )
+                    }
+                }
+            } else {
+                NavigationBar(
+                    modifier = Modifier.height(88.dp),
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    tonalElevation = 0.dp
+                ) {
+                    NavigationBarItem(
+                        selected = currentTab == 0,
+                        onClick = { currentTab = 0 },
+                        icon = { Icon(Icons.AutoMirrored.Filled.List, null, modifier = Modifier.size(24.dp)) },
+                        label = { Text("Gallery", fontSize = 11.sp, letterSpacing = 0.5.sp) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = MaterialTheme.colorScheme.primary,
+                            indicatorColor = MaterialTheme.colorScheme.primaryContainer
+                        )
                     )
-                )
-                NavigationBarItem(
-                    selected = currentTab == 1,
-                    onClick = { currentTab = 1 },
-                    icon = { Icon(Icons.Default.DateRange, null, modifier = Modifier.size(24.dp)) },
-                    label = { Text("Timeline", fontSize = 11.sp, letterSpacing = 0.5.sp) },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = MaterialTheme.colorScheme.primary,
-                        indicatorColor = MaterialTheme.colorScheme.primaryContainer
+                    NavigationBarItem(
+                        selected = currentTab == 1,
+                        onClick = { currentTab = 1 },
+                        icon = { Icon(Icons.Default.DateRange, null, modifier = Modifier.size(24.dp)) },
+                        label = { Text("Timeline", fontSize = 11.sp, letterSpacing = 0.5.sp) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = MaterialTheme.colorScheme.primary,
+                            indicatorColor = MaterialTheme.colorScheme.primaryContainer
+                        )
                     )
-                )
-                NavigationBarItem(
-                    selected = currentTab == 2,
-                    onClick = { currentTab = 2 },
-                    icon = { Icon(Icons.Default.Info, null, modifier = Modifier.size(24.dp)) },
-                    label = { Text("Stats", fontSize = 11.sp, letterSpacing = 0.5.sp) },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = MaterialTheme.colorScheme.primary,
-                        indicatorColor = MaterialTheme.colorScheme.primaryContainer
+                    NavigationBarItem(
+                        selected = currentTab == 2,
+                        onClick = { currentTab = 2 },
+                        icon = { Icon(Icons.Default.Info, null, modifier = Modifier.size(24.dp)) },
+                        label = { Text("Stats", fontSize = 11.sp, letterSpacing = 0.5.sp) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = MaterialTheme.colorScheme.primary,
+                            indicatorColor = MaterialTheme.colorScheme.primaryContainer
+                        )
                     )
-                )
-                NavigationBarItem(
-                    selected = currentTab == 3,
-                    onClick = { currentTab = 3 },
-                    icon = { Icon(Icons.Default.Settings, null, modifier = Modifier.size(24.dp)) },
-                    label = { Text("Setting", fontSize = 11.sp, letterSpacing = 0.5.sp) },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = MaterialTheme.colorScheme.primary,
-                        indicatorColor = MaterialTheme.colorScheme.primaryContainer
+                    NavigationBarItem(
+                        selected = currentTab == 3,
+                        onClick = { currentTab = 3 },
+                        icon = { Icon(Icons.Default.Settings, null, modifier = Modifier.size(24.dp)) },
+                        label = { Text("Setting", fontSize = 11.sp, letterSpacing = 0.5.sp) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = MaterialTheme.colorScheme.primary,
+                            indicatorColor = MaterialTheme.colorScheme.primaryContainer
+                        )
                     )
-                )
+                }
             }
         },
         containerColor = MaterialTheme.colorScheme.background
@@ -1301,7 +1376,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                             }
                         }
 
-                        // 複数選択中の上部バー
+                        // 複数選択中の上部バー (カウントと解除のみ)
                         if (selectedUris.isNotEmpty()) {
                             Surface(
                                 modifier = Modifier.fillMaxWidth(),
@@ -1310,106 +1385,13 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                             ) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        IconButton(onClick = { selectedUris = emptySet() }) {
-                                            Icon(Icons.Default.Close, contentDescription = "解除")
-                                        }
-                                        Text("${selectedUris.size} 枚選択中 (最大4枚)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    IconButton(onClick = { selectedUris = emptySet() }) {
+                                        Icon(Icons.Default.Close, contentDescription = "解除")
                                     }
-
-                                    Button(
-                                        onClick = {
-                                            val uris = selectedUris.toList()
-                                            val selectedPhotoEntities = uris.mapNotNull { uri ->
-                                                val local = viewModel.localPhotos.find { it.uri == uri }
-                                                local?.let { dbPhotoMap[it.filePath] ?: PhotoEntity(filePath = it.filePath, fileType = it.fileType) }
-                                            }
-                                            
-                                            scope.launch(Dispatchers.IO) {
-                                                val shareableUris = uris.map { uri ->
-                                                    val local = viewModel.localPhotos.find { it.uri == uri }
-                                                    prepareShareUri(context, local?.filePath ?: "", uri)
-                                                }
-                                                if (shareableUris.isEmpty()) return@launch
-
-                                                withContext(Dispatchers.Main) {
-                                                    shareToPackage(context, null, shareableUris, null) {
-                                                        viewModel.savePendingPhotos(selectedPhotoEntities)
-                                                        viewModel.shareActionStarted = true
-                                                        selectedUris = emptySet()
-                                                    }
-                                                }
-                                            }
-                                        },
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                                    ) {
-                                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text("共有", fontSize = 11.sp)
-                                    }
-
-                                    Spacer(modifier = Modifier.width(4.dp))
-
-                                    // X (Twitter) 直接共有
-                                    IconButton(
-                                        onClick = {
-                                            val uris = selectedUris.toList()
-                                            val selectedPhotoEntities = uris.mapNotNull { uri ->
-                                                val local = viewModel.localPhotos.find { it.uri == uri }
-                                                local?.let { dbPhotoMap[it.filePath] ?: PhotoEntity(filePath = it.filePath, fileType = it.fileType) }
-                                            }
-                                            scope.launch(Dispatchers.IO) {
-                                                val shareableUris = uris.map { uri ->
-                                                    val local = viewModel.localPhotos.find { it.uri == uri }
-                                                    prepareShareUri(context, local?.filePath ?: "", uri)
-                                                }
-                                                if (shareableUris.isEmpty()) return@launch
-
-                                                withContext(Dispatchers.Main) {
-                                                    shareToPackage(context, "com.twitter.android", shareableUris, null) {
-                                                        viewModel.savePendingPhotos(selectedPhotoEntities)
-                                                        viewModel.shareActionStarted = true
-                                                        selectedUris = emptySet()
-                                                    }
-                                                }
-                                            }
-                                        },
-                                        modifier = Modifier.size(36.dp)
-                                    ) {
-                                        Text("X", fontWeight = FontWeight.Black, fontSize = 16.sp)
-                                    }
-
-                                    // Lightroom 直接共有
-                                    IconButton(
-                                        onClick = {
-                                            val uris = selectedUris.toList()
-                                            val selectedPhotoEntities = uris.mapNotNull { uri ->
-                                                val local = viewModel.localPhotos.find { it.uri == uri }
-                                                local?.let { dbPhotoMap[it.filePath] ?: PhotoEntity(filePath = it.filePath, fileType = it.fileType) }
-                                            }
-                                            scope.launch(Dispatchers.IO) {
-                                                val shareableUris = uris.map { uri ->
-                                                    val local = viewModel.localPhotos.find { it.uri == uri }
-                                                    prepareShareUri(context, local?.filePath ?: "", uri)
-                                                }
-                                                if (shareableUris.isEmpty()) return@launch
-
-                                                withContext(Dispatchers.Main) {
-                                                    shareToPackage(context, "com.adobe.lrmobile", shareableUris, null) {
-                                                        viewModel.savePendingPhotos(selectedPhotoEntities)
-                                                        viewModel.shareActionStarted = true
-                                                        selectedUris = emptySet()
-                                                    }
-                                                }
-                                            }
-                                        },
-                                        modifier = Modifier.size(36.dp)
-                                    ) {
-                                        Text("Lr", fontWeight = FontWeight.Black, fontSize = 16.sp, color = Color(0xFF001E36))
-                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("${selectedUris.size} 枚選択中 (最大4枚)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                                 }
                             }
                         } else {
@@ -2998,6 +2980,33 @@ fun ModernPhotoItem(
                 }
             }
         }
+    }
+}
+
+@Composable
+fun SelectionActionButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
+    text: String? = null,
+    label: String,
+    iconColor: Color = MaterialTheme.colorScheme.onSurface,
+    textColor: Color = MaterialTheme.colorScheme.onSurface,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable { onClick() }
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        if (icon != null) {
+            Icon(icon, null, tint = iconColor, modifier = Modifier.size(24.dp))
+        } else if (text != null) {
+            Text(text, fontWeight = FontWeight.Black, fontSize = 18.sp, color = textColor)
+        }
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(label, fontSize = 10.sp, fontWeight = FontWeight.Medium)
     }
 }
 
