@@ -1,5 +1,6 @@
 package com.example.kameko
 
+import android.app.Activity
 import android.Manifest
 import android.content.ClipData
 import android.content.Context
@@ -14,9 +15,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.activity.enableEdgeToEdge
@@ -24,6 +29,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -57,8 +69,11 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -3170,7 +3185,28 @@ fun PhotoDetailView(
 ) {
     val pagerState = rememberPagerState(initialPage = initialIndex, pageCount = { allPhotos.size })
     val context = LocalContext.current
+    val view = LocalView.current
     val scope = rememberCoroutineScope()
+
+    var isFullScreen by remember { mutableStateOf(false) }
+
+    // 全画面表示中はステータスバーのアイコンを白にする（背景が黒になるため）
+    val window = (context as? Activity)?.window
+    if (window != null) {
+        val controller = remember(window, view) { WindowCompat.getInsetsController(window, view) }
+        SideEffect {
+            controller.isAppearanceLightStatusBars = !isFullScreen
+        }
+    }
+
+    val backgroundColor by animateColorAsState(
+        targetValue = if (isFullScreen) Color.Black else MaterialTheme.colorScheme.background,
+        label = "backgroundColor"
+    )
+
+    BackHandler(enabled = isFullScreen) {
+        isFullScreen = false
+    }
 
     val currentLocalPhoto = allPhotos[pagerState.currentPage]
     val dbPhoto = dbPhotoMap[currentLocalPhoto.filePath]
@@ -3286,58 +3322,134 @@ fun PhotoDetailView(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { },
-                navigationIcon = {
-                    IconButton(onClick = { onDismiss() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "戻る")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                    titleContentColor = MaterialTheme.colorScheme.onSurface,
-                    navigationIconContentColor = MaterialTheme.colorScheme.onSurface
+            AnimatedVisibility(
+                visible = !isFullScreen,
+                enter = fadeIn(),
+                exit = fadeOut()
+            ) {
+                TopAppBar(
+                    title = { },
+                    navigationIcon = {
+                        IconButton(onClick = { onDismiss() }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "戻る")
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        titleContentColor = MaterialTheme.colorScheme.onSurface,
+                        navigationIconContentColor = MaterialTheme.colorScheme.onSurface
+                    )
                 )
-            )
+            }
         },
-        containerColor = MaterialTheme.colorScheme.background
+        containerColor = backgroundColor
     ) { innerPadding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding)
-                .verticalScroll(rememberScrollState())
+                .then(if (isFullScreen) Modifier else Modifier.padding(innerPadding))
+                .then(if (isFullScreen) Modifier else Modifier.verticalScroll(rememberScrollState()))
         ) {
-            // --- ① 写真表示エリア (Pager) ---
             HorizontalPager(
                 state = pagerState,
+                userScrollEnabled = true, // 常に有効にする（内部の拡大状態で制御）
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 450.dp)
+                    .then(if (isFullScreen) Modifier.weight(1f) else Modifier.height(450.dp))
                     .background(Color.Black)
             ) { page ->
                 val photo = allPhotos[page]
-                Box(modifier = Modifier.fillMaxSize()) {
+                
+                // ズームとスワイプのための状態
+                var scale by remember { mutableStateOf(1f) }
+                var offset by remember { mutableStateOf(Offset.Zero) }
+                var swipeOffset by remember { mutableStateOf(0f) }
+
+                // ページが切り替わった時、または全画面表示が解除された時にズームをリセット
+                LaunchedEffect(pagerState.currentPage, isFullScreen) {
+                    if (!isFullScreen || pagerState.currentPage != page) {
+                        scale = 1f
+                        offset = Offset.Zero
+                        swipeOffset = 0f
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(isFullScreen, scale) {
+                            if (!isFullScreen) return@pointerInput
+                            
+                            // 手動でジェスチャーを制御して Pager との競合を防ぐ
+                            awaitPointerEventScope {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val zoomChange = event.calculateZoom()
+                                    val panChange = event.calculatePan()
+                                    
+                                    if (scale > 1.05f || zoomChange != 1f) {
+                                        // 拡大中またはピンチ操作開始：すべてのイベントを消費してズーム/パンを行う
+                                        scale = (scale * zoomChange).coerceIn(1f, 5f)
+                                        offset += panChange
+                                        event.changes.forEach { it.consume() }
+                                    } else {
+                                        // 等倍時：1本指の操作
+                                        val dragAmount = panChange
+                                        if (kotlin.math.abs(dragAmount.y) > kotlin.math.abs(dragAmount.x) && kotlin.math.abs(dragAmount.y) > 0) {
+                                            // 縦方向の動きが支配的な場合のみ消費して下スワイプ処理へ
+                                            swipeOffset += dragAmount.y
+                                            if (swipeOffset < 0) swipeOffset = 0f
+                                            event.changes.forEach { it.consume() }
+                                        } else {
+                                            // 横方向の動き、または動きがない場合は消費しない
+                                            // これによりイベントが HorizontalPager に伝わり、ページめくりができる
+                                        }
+                                    }
+
+                                    // 指が離された時の判定
+                                    if (event.changes.all { !it.pressed }) {
+                                        if (scale <= 1.05f) {
+                                            if (swipeOffset > 400f) {
+                                                onDismiss()
+                                            }
+                                            swipeOffset = 0f
+                                            offset = Offset.Zero
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .graphicsLayer(
+                            scaleX = scale,
+                            scaleY = scale,
+                            translationX = offset.x,
+                            translationY = offset.y + swipeOffset,
+                            alpha = (1f - (swipeOffset / 1000f)).coerceIn(0f, 1f)
+                        )
+                        .clickable { isFullScreen = !isFullScreen }
+                ) {
                     AsyncImage(
                         model = photo.uri,
                         contentDescription = null,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .wrapContentHeight()
-                            .align(Alignment.Center),
+                        modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Fit
                     )
                 }
             }
 
             // --- ② 操作・情報エリア ---
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color.White, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+            AnimatedVisibility(
+                visible = !isFullScreen,
+                enter = fadeIn(),
+                exit = fadeOut()
             ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.White, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
                 // メタデータ表示
                 Card(
                     colors = CardDefaults.cardColors(containerColor = Color(0xFFF8F9FA)),
@@ -3591,6 +3703,7 @@ fun PhotoDetailView(
             }
         }
     }
+}
 }
 
 @Composable
