@@ -1,5 +1,6 @@
 package com.example.kameko
 
+import android.app.Activity
 import android.Manifest
 import android.content.ClipData
 import android.content.Context
@@ -14,9 +15,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.activity.enableEdgeToEdge
@@ -59,6 +64,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -3170,7 +3176,28 @@ fun PhotoDetailView(
 ) {
     val pagerState = rememberPagerState(initialPage = initialIndex, pageCount = { allPhotos.size })
     val context = LocalContext.current
+    val view = LocalView.current
     val scope = rememberCoroutineScope()
+
+    var isFullScreen by remember { mutableStateOf(false) }
+
+    // 全画面表示中はステータスバーのアイコンを白にする（背景が黒になるため）
+    val window = (context as? Activity)?.window
+    if (window != null) {
+        val controller = remember(window, view) { WindowCompat.getInsetsController(window, view) }
+        SideEffect {
+            controller.isAppearanceLightStatusBars = !isFullScreen
+        }
+    }
+
+    val backgroundColor by animateColorAsState(
+        targetValue = if (isFullScreen) Color.Black else MaterialTheme.colorScheme.background,
+        label = "backgroundColor"
+    )
+
+    BackHandler(enabled = isFullScreen) {
+        isFullScreen = false
+    }
 
     val currentLocalPhoto = allPhotos[pagerState.currentPage]
     val dbPhoto = dbPhotoMap[currentLocalPhoto.filePath]
@@ -3286,58 +3313,70 @@ fun PhotoDetailView(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { },
-                navigationIcon = {
-                    IconButton(onClick = { onDismiss() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "戻る")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                    titleContentColor = MaterialTheme.colorScheme.onSurface,
-                    navigationIconContentColor = MaterialTheme.colorScheme.onSurface
+            AnimatedVisibility(
+                visible = !isFullScreen,
+                enter = fadeIn(),
+                exit = fadeOut()
+            ) {
+                TopAppBar(
+                    title = { },
+                    navigationIcon = {
+                        IconButton(onClick = { onDismiss() }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "戻る")
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        titleContentColor = MaterialTheme.colorScheme.onSurface,
+                        navigationIconContentColor = MaterialTheme.colorScheme.onSurface
+                    )
                 )
-            )
+            }
         },
-        containerColor = MaterialTheme.colorScheme.background
+        containerColor = backgroundColor
     ) { innerPadding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding)
-                .verticalScroll(rememberScrollState())
+                .then(if (isFullScreen) Modifier else Modifier.padding(innerPadding))
+                .then(if (isFullScreen) Modifier else Modifier.verticalScroll(rememberScrollState()))
         ) {
             // --- ① 写真表示エリア (Pager) ---
             HorizontalPager(
                 state = pagerState,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 450.dp)
+                    .then(if (isFullScreen) Modifier.weight(1f) else Modifier.height(450.dp))
                     .background(Color.Black)
             ) { page ->
                 val photo = allPhotos[page]
-                Box(modifier = Modifier.fillMaxSize()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clickable { isFullScreen = !isFullScreen }
+                ) {
                     AsyncImage(
                         model = photo.uri,
                         contentDescription = null,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .wrapContentHeight()
-                            .align(Alignment.Center),
+                        modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Fit
                     )
                 }
             }
 
             // --- ② 操作・情報エリア ---
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color.White, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+            AnimatedVisibility(
+                visible = !isFullScreen,
+                enter = fadeIn(),
+                exit = fadeOut()
             ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.White, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
                 // メタデータ表示
                 Card(
                     colors = CardDefaults.cardColors(containerColor = Color(0xFFF8F9FA)),
@@ -3591,6 +3630,7 @@ fun PhotoDetailView(
             }
         }
     }
+}
 }
 
 @Composable
