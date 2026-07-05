@@ -29,6 +29,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -62,6 +69,8 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -3341,18 +3350,82 @@ fun PhotoDetailView(
                 .then(if (isFullScreen) Modifier else Modifier.padding(innerPadding))
                 .then(if (isFullScreen) Modifier else Modifier.verticalScroll(rememberScrollState()))
         ) {
-            // --- ① 写真表示エリア (Pager) ---
             HorizontalPager(
                 state = pagerState,
+                userScrollEnabled = true, // 常に有効にする（内部の拡大状態で制御）
                 modifier = Modifier
                     .fillMaxWidth()
                     .then(if (isFullScreen) Modifier.weight(1f) else Modifier.height(450.dp))
                     .background(Color.Black)
             ) { page ->
                 val photo = allPhotos[page]
+                
+                // ズームとスワイプのための状態
+                var scale by remember { mutableStateOf(1f) }
+                var offset by remember { mutableStateOf(Offset.Zero) }
+                var swipeOffset by remember { mutableStateOf(0f) }
+
+                // ページが切り替わった時、または全画面表示が解除された時にズームをリセット
+                LaunchedEffect(pagerState.currentPage, isFullScreen) {
+                    if (!isFullScreen || pagerState.currentPage != page) {
+                        scale = 1f
+                        offset = Offset.Zero
+                        swipeOffset = 0f
+                    }
+                }
+
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
+                        .pointerInput(isFullScreen, scale) {
+                            if (!isFullScreen) return@pointerInput
+                            
+                            // 手動でジェスチャーを制御して Pager との競合を防ぐ
+                            awaitPointerEventScope {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val zoomChange = event.calculateZoom()
+                                    val panChange = event.calculatePan()
+                                    
+                                    if (scale > 1.05f || zoomChange != 1f) {
+                                        // 拡大中またはピンチ操作開始：すべてのイベントを消費してズーム/パンを行う
+                                        scale = (scale * zoomChange).coerceIn(1f, 5f)
+                                        offset += panChange
+                                        event.changes.forEach { it.consume() }
+                                    } else {
+                                        // 等倍時：1本指の操作
+                                        val dragAmount = panChange
+                                        if (kotlin.math.abs(dragAmount.y) > kotlin.math.abs(dragAmount.x) && kotlin.math.abs(dragAmount.y) > 0) {
+                                            // 縦方向の動きが支配的な場合のみ消費して下スワイプ処理へ
+                                            swipeOffset += dragAmount.y
+                                            if (swipeOffset < 0) swipeOffset = 0f
+                                            event.changes.forEach { it.consume() }
+                                        } else {
+                                            // 横方向の動き、または動きがない場合は消費しない
+                                            // これによりイベントが HorizontalPager に伝わり、ページめくりができる
+                                        }
+                                    }
+
+                                    // 指が離された時の判定
+                                    if (event.changes.all { !it.pressed }) {
+                                        if (scale <= 1.05f) {
+                                            if (swipeOffset > 400f) {
+                                                onDismiss()
+                                            }
+                                            swipeOffset = 0f
+                                            offset = Offset.Zero
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .graphicsLayer(
+                            scaleX = scale,
+                            scaleY = scale,
+                            translationX = offset.x,
+                            translationY = offset.y + swipeOffset,
+                            alpha = (1f - (swipeOffset / 1000f)).coerceIn(0f, 1f)
+                        )
                         .clickable { isFullScreen = !isFullScreen }
                 ) {
                     AsyncImage(
