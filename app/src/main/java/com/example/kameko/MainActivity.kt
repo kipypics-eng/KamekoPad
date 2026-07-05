@@ -789,6 +789,36 @@ class PhotoViewModel(
             }
         }
     }
+
+    fun assignEventToPhotos(uris: Set<Uri>, eventId: Long?) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val allDbPhotos = photoDao.getAllPhotosOnce().associateBy { it.filePath }
+            val toUpdate = mutableListOf<PhotoEntity>()
+            val toInsert = mutableListOf<PhotoEntity>()
+
+            uris.forEach { uri ->
+                val local = localPhotos.find { it.uri == uri } ?: return@forEach
+                val existing = allDbPhotos[local.filePath]
+                if (existing != null) {
+                    if (existing.eventId != eventId) {
+                        toUpdate.add(existing.copy(eventId = eventId))
+                    }
+                } else {
+                    toInsert.add(
+                        PhotoEntity(
+                            filePath = local.filePath,
+                            fileType = local.fileType,
+                            status = PhotoStatus.SHOT.name,
+                            eventId = eventId
+                        )
+                    )
+                }
+            }
+
+            if (toUpdate.isNotEmpty()) photoDao.updatePhotos(toUpdate)
+            if (toInsert.isNotEmpty()) photoDao.insertPhotos(toInsert)
+        }
+    }
 }
 
 class PhotoViewModelFactory(
@@ -866,6 +896,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
     var isExifFilterExpanded by remember { mutableStateOf(false) }
     var selectedPhotoIndex by remember { mutableStateOf<Int?>(null) }
     var selectedUris by remember { mutableStateOf(setOf<Uri>()) } // 複数選択用
+    var showMultiEventAssignDialog by remember { mutableStateOf(false) }
 
     // 追加：OSによってViewModelが初期化された場合でも、DBから写真が読み込まれた瞬間に未確認リストを復元する
     LaunchedEffect(photos) {
@@ -1239,6 +1270,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                     tonalElevation = 8.dp,
                     contentPadding = PaddingValues(0.dp)
                 ) {
+                    val canMinorActions = selectedUris.size <= 4
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -1247,23 +1279,32 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                         SelectionActionButton(
                             icon = Icons.Default.Share,
                             label = "共有",
+                            enabled = canMinorActions,
                             onClick = { onMultiShare(null) }
                         )
                         SelectionActionButton(
                             text = "X",
                             label = "X Post",
+                            enabled = canMinorActions,
                             onClick = { onMultiShare("com.twitter.android") }
                         )
                         SelectionActionButton(
                             text = "Lr",
-                            label = "Lightroom",
+                            label = "Lr",
                             textColor = Color(0xFF001E36),
+                            enabled = canMinorActions,
                             onClick = { onMultiShare("com.adobe.lrmobile") }
+                        )
+                        SelectionActionButton(
+                            icon = Icons.Default.Place,
+                            label = "現場設定",
+                            onClick = { showMultiEventAssignDialog = true }
                         )
                         SelectionActionButton(
                             icon = Icons.Default.CheckCircle,
                             label = "POST済",
                             iconColor = PostGreen,
+                            enabled = canMinorActions,
                             onClick = { onMultiPost() }
                         )
                     }
@@ -1391,7 +1432,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                         Icon(Icons.Default.Close, contentDescription = "解除")
                                     }
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text("${selectedUris.size} 枚選択中 (最大4枚)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    Text("${selectedUris.size} 枚選択中 (最大10枚)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                                 }
                             }
                         } else {
@@ -1909,7 +1950,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                                 } else if (selectedUris.isNotEmpty()) {
                                                     if (isSelected) {
                                                         selectedUris = selectedUris - item.uri
-                                                    } else if (selectedUris.size < 4) {
+                                                    } else if (selectedUris.size < 10) {
                                                         selectedUris = selectedUris + item.uri
                                                     }
                                                 } else {
@@ -1962,6 +2003,54 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                 }
             }
         }
+    }
+
+    if (showMultiEventAssignDialog) {
+        AlertDialog(
+            onDismissRequest = { showMultiEventAssignDialog = false },
+            title = { Text("選択した写真に現場を割り当て", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${selectedUris.size} 枚の写真に割り当てる現場を選択してください", fontSize = 14.sp)
+                    
+                    Box(modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp)) {
+                        LazyColumn {
+                            item {
+                                DropdownMenuItem(
+                                    text = { Text("❌ 現場の紐付けを解除", color = Color.Red) },
+                                    onClick = {
+                                        viewModel.assignEventToPhotos(selectedUris, null)
+                                        showMultiEventAssignDialog = false
+                                        selectedUris = emptySet()
+                                    }
+                                )
+                                HorizontalDivider()
+                            }
+                            items(sortedDbEvents) { event ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Column {
+                                            Text(event.eventDate, fontSize = 10.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                                            Text(event.name, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                            Text(event.venue, fontSize = 12.sp, color = Color.Gray)
+                                        }
+                                    },
+                                    onClick = {
+                                        viewModel.assignEventToPhotos(selectedUris, event.id)
+                                        showMultiEventAssignDialog = false
+                                        selectedUris = emptySet()
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showMultiEventAssignDialog = false }) { Text("キャンセル") }
+            }
+        )
     }
 
     // --- 現場登録ダイアログ ---
@@ -2990,12 +3079,15 @@ fun SelectionActionButton(
     label: String,
     iconColor: Color = MaterialTheme.colorScheme.onSurface,
     textColor: Color = MaterialTheme.colorScheme.onSurface,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
+    val alpha = if (enabled) 1f else 0.3f
     Column(
         modifier = Modifier
+            .alpha(alpha)
             .clip(RoundedCornerShape(12.dp))
-            .clickable { onClick() }
+            .clickable(enabled = enabled) { onClick() }
             .padding(horizontal = 12.dp, vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
