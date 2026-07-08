@@ -504,98 +504,117 @@ class PhotoViewModel(
         }
     }
 
-    suspend fun registerPhotosWithAutoEvent(photoItems: List<LocalPhotoItem>, context: Context) = withContext(Dispatchers.IO) {
+    suspend fun registerPhotosWithAutoEvent(
+        photoItems: List<LocalPhotoItem>, 
+        context: Context,
+        lastScanTime: Long = 0L
+    ) = withContext(Dispatchers.IO) {
+        // 前回のスキャンより新しい写真、またはDBに未登録の写真のみを対象にする
+        val targetItems = photoItems.filter { it.dateAdded > lastScanTime }
+        if (targetItems.isEmpty()) return@withContext
+
         val allEvents = eventDao.getAllEventsOnce()
         val allDbPhotos = photoDao.getAllPhotosOnce().associateBy { it.filePath }
         
-        photoItems.forEach { item ->
+        val toUpdate = mutableListOf<PhotoEntity>()
+        val toInsert = mutableListOf<PhotoEntity>()
+
+        // 高速化のため、イベントの日付をあらかじめ正規化してMap化しておく
+        val eventMap = allEvents.groupBy { it.eventDate.trim().replace("/", "-") }
+
+        targetItems.forEach { item ->
             val path = item.filePath
             val existing = allDbPhotos[path]
             
-            // 現場の自動割り付け判定
+            // 既に必要な情報が揃っている場合はスキップ（大幅な高速化）
+            if (existing != null && existing.iso != null && existing.cameraMake != null && existing.eventId != null) {
+                return@forEach
+            }
+
             var photoDate = item.dateStr.replace("/", "-")
             
             // EXIF情報の抽出
-            // 撮影日がズレる問題に対応するため、現場が未設定 or 整合性が不十分な場合にEXIFを優先する
-            if (existing == null || existing.iso == null || existing.cameraMake == null || existing.eventId == null) {
-                var extractedIso: Int? = null
-                var extractedFocal: Double? = null
-                var extractedAperture: Double? = null
-                var extractedSs: Double? = null
-                var extractedMake: String? = null
-                var extractedDate: String? = null
+            // (以下省略せずそのまま保持)
+            var extractedIso: Int? = null
+            var extractedFocal: Double? = null
+            var extractedAperture: Double? = null
+            var extractedSs: Double? = null
+            var extractedMake: String? = null
+            var extractedDate: String? = null
 
-                try {
-                    context.contentResolver.openInputStream(item.uri)?.use { inputStream ->
-                        val exif = ExifInterface(inputStream)
-                        extractedIso = exif.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, -1)
-                            .let { if (it == -1) exif.getAttributeInt(ExifInterface.TAG_ISO_SPEED, -1) else it }
-                            .let { if (it == -1) null else it }
-                        
-                        extractedFocal = exif.getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, -1)
-                            .let { if (it == -1) null else it.toDouble() }
-                        
-                        extractedAperture = exif.getAttributeDouble(ExifInterface.TAG_F_NUMBER, -1.0)
-                            .let { if (it <= 0) null else it }
-                        
-                        extractedSs = exif.getAttributeDouble(ExifInterface.TAG_EXPOSURE_TIME, -1.0)
-                            .let { if (it <= 0) null else it }
-                        
-                        extractedMake = (exif.getAttribute(ExifInterface.TAG_MAKE) ?: exif.getAttribute(ExifInterface.TAG_MODEL))?.trim()
+            try {
+                context.contentResolver.openInputStream(item.uri)?.use { inputStream ->
+                    val exif = ExifInterface(inputStream)
+                    extractedIso = exif.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, -1)
+                        .let { if (it == -1) exif.getAttributeInt(ExifInterface.TAG_ISO_SPEED, -1) else it }
+                        .let { if (it == -1) null else it }
+                    
+                    extractedFocal = exif.getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, -1)
+                        .let { if (it == -1) null else it.toDouble() }
+                    
+                    extractedAperture = exif.getAttributeDouble(ExifInterface.TAG_F_NUMBER, -1.0)
+                        .let { if (it <= 0) null else it }
+                    
+                    extractedSs = exif.getAttributeDouble(ExifInterface.TAG_EXPOSURE_TIME, -1.0)
+                        .let { if (it <= 0) null else it }
+                    
+                    extractedMake = (exif.getAttribute(ExifInterface.TAG_MAKE) ?: exif.getAttribute(ExifInterface.TAG_MODEL))?.trim()
 
-                        val exifDate = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                            ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
-                        if (exifDate != null) {
-                            extractedDate = exifDate.substringBefore(" ").replace(":", "-")
-                        }
+                    val exifDate = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                        ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+                    if (exifDate != null) {
+                        extractedDate = exifDate.substringBefore(" ").replace(":", "-")
                     }
-                } catch (e: Exception) { }
+                }
+            } catch (e: Exception) { }
 
-                if (extractedDate != null) {
-                    photoDate = extractedDate!!
+            if (extractedDate != null) {
+                photoDate = extractedDate!!
+            }
+
+            // Mapから高速に検索
+            val matchingEventId = eventMap[photoDate]?.firstOrNull()?.id
+
+            if (existing == null) {
+                toInsert.add(PhotoEntity(
+                    filePath = path, 
+                    fileType = item.fileType, 
+                    status = PhotoStatus.SHOT.name, 
+                    eventId = matchingEventId,
+                    iso = extractedIso,
+                    focalLength = extractedFocal,
+                    aperture = extractedAperture,
+                    shutterSpeed = extractedSs,
+                    cameraMake = extractedMake
+                ))
+            } else {
+                // 撮影日と現場の日付が一致しているか厳格にチェック
+                val currentEvent = allEvents.find { it.id == existing.eventId }
+                val currentEventDate = currentEvent?.eventDate?.trim()?.replace("/", "-")
+                
+                val finalEventId = if (currentEventDate != null && currentEventDate != photoDate) {
+                    matchingEventId
+                } else {
+                    existing.eventId ?: matchingEventId
                 }
 
-                val matchingEventId = allEvents.find { 
-                    val eventDate = it.eventDate.trim().replace("/", "-")
-                    eventDate.isNotEmpty() && eventDate == photoDate
-                }?.id
-
-                if (existing == null) {
-                    photoDao.insertPhoto(PhotoEntity(
-                        filePath = path, 
-                        fileType = item.fileType, 
-                        status = PhotoStatus.SHOT.name, 
-                        eventId = matchingEventId,
-                        iso = extractedIso,
-                        focalLength = extractedFocal,
-                        aperture = extractedAperture,
-                        shutterSpeed = extractedSs,
-                        cameraMake = extractedMake
-                    ))
-                } else {
-                    // 撮影日と現場の日付が一致しているか厳格にチェック
-                    val currentEvent = allEvents.find { it.id == existing.eventId }
-                    val currentEventDate = currentEvent?.eventDate?.trim()?.replace("/", "-")
-                    
-                    val finalEventId = if (currentEventDate != null && currentEventDate != photoDate) {
-                        // 日付が一致しない場合（イベントを消した、または間違って紐付いた）
-                        // 正しい日付のイベントがあればそこへ、なければ未割り当て(null)に強制移動
-                        matchingEventId
-                    } else {
-                        existing.eventId ?: matchingEventId
-                    }
-
-                    photoDao.updatePhoto(existing.copy(
-                        eventId = finalEventId,
-                        iso = existing.iso ?: extractedIso,
-                        focalLength = existing.focalLength ?: extractedFocal,
-                        aperture = existing.aperture ?: extractedAperture,
-                        shutterSpeed = existing.shutterSpeed ?: extractedSs,
-                        cameraMake = existing.cameraMake ?: extractedMake
-                    ))
+                val updated = existing.copy(
+                    eventId = finalEventId,
+                    iso = existing.iso ?: extractedIso,
+                    focalLength = existing.focalLength ?: extractedFocal,
+                    aperture = existing.aperture ?: extractedAperture,
+                    shutterSpeed = existing.shutterSpeed ?: extractedSs,
+                    cameraMake = existing.cameraMake ?: extractedMake
+                )
+                if (updated != existing) {
+                    toUpdate.add(updated)
                 }
             }
         }
+
+        // まとめて書き込み（DBアクセスの劇的な削減）
+        if (toInsert.isNotEmpty()) photoDao.insertPhotos(toInsert)
+        if (toUpdate.isNotEmpty()) photoDao.updatePhotos(toUpdate)
     }
 
     fun addEvent(event: EventEntity, currentPhotos: List<LocalPhotoItem>) {
@@ -1080,16 +1099,32 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
             if (viewModel.localPhotos.isEmpty()) {
                 viewModel.isRefreshing = true
 
+                val prefs = context.getSharedPreferences("kameko_prefs", Context.MODE_PRIVATE)
+                val lastScanTime = prefs.getLong("last_scan_time", 0L)
+                var maxDateAdded = lastScanTime
+
+                // 起動時はUI表示を最優先
+                val allPhotos = mutableListOf<LocalPhotoItem>()
                 loadPhotosWithMimeStreaming(context) { batch ->
-                    val currentUris = viewModel.localPhotos.map { it.uri.toString() }.toSet()
-                    val uniqueBatch = batch.filter { it.uri.toString() !in currentUris }
-                    if (uniqueBatch.isNotEmpty()) {
-                        viewModel.localPhotos = viewModel.localPhotos + uniqueBatch
+                    allPhotos.addAll(batch)
+                    viewModel.localPhotos = allPhotos.toList()
+                    
+                    // 最初の1バッチ（100枚）が出たら、ユーザーが待たされている感を減らすためにバーを早めに消す検討
+                    if (allPhotos.size >= 100) {
+                        viewModel.isRefreshing = false 
                     }
                     
-                    viewModel.registerPhotosWithAutoEvent(batch, context)
+                    batch.forEach { if (it.dateAdded > maxDateAdded) maxDateAdded = it.dateAdded }
                 }
-                viewModel.isRefreshing = false
+                
+                // 全件ロード完了後にバックグラウンドで解析
+                scope.launch(Dispatchers.IO) {
+                    viewModel.registerPhotosWithAutoEvent(allPhotos, context, lastScanTime)
+                    prefs.edit().putLong("last_scan_time", maxDateAdded).apply()
+                    withContext(Dispatchers.Main) {
+                        viewModel.isRefreshing = false // 念のため最後にも消す
+                    }
+                }
             }
         }
     }
@@ -1117,13 +1152,21 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                     // 1. UIをまず更新
                     viewModel.localPhotos = latestPhotos
 
-                    // 2. 新規写真をDBに登録
-                    viewModel.registerPhotosWithAutoEvent(latestPhotos, context)
-                    
-                    delay(300)
-                    viewModel.isRefreshing = false
+                    // 2. 解析はバックグラウンドで（UIをブロックしない）
+                    scope.launch(Dispatchers.IO) {
+                        val prefs = context.getSharedPreferences("kameko_prefs", Context.MODE_PRIVATE)
+                        val lastScanTime = if (isForce) 0L else prefs.getLong("last_scan_time", 0L)
+                        
+                        viewModel.registerPhotosWithAutoEvent(latestPhotos, context, lastScanTime)
+                        
+                        val maxAdded = latestPhotos.maxOfOrNull { it.dateAdded } ?: 0L
+                        prefs.edit().putLong("last_scan_time", maxAdded).apply()
+
+                        withContext(Dispatchers.Main) {
+                            viewModel.isRefreshing = false
+                        }
+                    }
                 } else {
-                    delay(300)
                     viewModel.isRefreshing = false
                 }
             }
