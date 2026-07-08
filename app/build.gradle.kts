@@ -64,4 +64,9 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation("androidx.exifinterface:exifinterface:1.3.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.0")
+
+    // Paging 3
+    implementation("androidx.paging:paging-runtime:3.3.0")
+    implementation("androidx.paging:paging-compose:3.3.0")
+    implementation(libs.androidx.room.paging)
 }
