@@ -1,5 +1,6 @@
 package com.example.kameko
 
+import androidx.paging.PagingSource
 import androidx.room.*
 import kotlinx.coroutines.flow.Flow
 
@@ -7,6 +8,32 @@ import kotlinx.coroutines.flow.Flow
 interface PhotoDao {
     @Query("SELECT * FROM photos ORDER BY id DESC")
     fun getAllPhotos(): Flow<List<PhotoEntity>>
+
+    @Query("SELECT * FROM photos ORDER BY id DESC")
+    fun getAllPhotosPaging(): PagingSource<Int, PhotoEntity>
+
+    @Query("""
+        SELECT * FROM photos 
+        WHERE (:status = 'ALL' OR status = :status)
+        AND (:type = 'ALL' OR fileType = :type)
+        AND (:eventId IS NULL OR eventId = :eventId)
+        AND (:make IS NULL OR cameraMake = :make)
+        ORDER BY 
+            CASE :sortType
+                WHEN 'DATE_ADDED' THEN dateAdded
+                WHEN 'DATE_TAKEN' THEN COALESCE(dateTaken, dateAdded)
+                WHEN 'DATE_MODIFIED' THEN COALESCE(dateModified, dateAdded)
+                ELSE dateAdded
+            END DESC,
+            id DESC
+    """)
+    fun getFilteredPhotosPaging(
+        status: String,
+        type: String,
+        eventId: Long?,
+        make: String?,
+        sortType: String
+    ): PagingSource<Int, PhotoEntity>
 
     @Query("SELECT * FROM photos")
     suspend fun getAllPhotosOnce(): List<PhotoEntity>

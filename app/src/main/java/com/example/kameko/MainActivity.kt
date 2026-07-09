@@ -84,18 +84,26 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.AbstractSavedStateViewModelFactory
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.lifecycle.viewModelScope
+import androidx.paging.Pager
+import androidx.paging.PagingConfig
+import androidx.paging.PagingData
+import androidx.paging.cachedIn
+import androidx.paging.compose.collectAsLazyPagingItems
+import kotlinx.coroutines.flow.flatMapLatest
+import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.viewmodel.compose.viewModel
-import coil.compose.AsyncImage
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import coil.compose.AsyncImage
 import coil.ImageLoader
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
@@ -480,6 +488,24 @@ class PhotoViewModel(
         viewModelScope, SharingStarted.WhileSubscribed(5000), PostStats(0, 0)
     )
 
+    // Paging 3による写真リスト
+    val pagedPhotos = snapshotFlow {
+        Quadruple(selectedStatusFilter, selectedTypeFilter, selectedEventFilterId, selectedMakeFilter) to selectedSortType
+    }.flatMapLatest { (filters, sortType) ->
+        val (status, type, eventId, make) = filters
+        Pager(
+            config = PagingConfig(pageSize = 50, prefetchDistance = 100, enablePlaceholders = true),
+            pagingSourceFactory = { photoDao.getFilteredPhotosPaging(status, type, eventId, make, sortType.name) }
+        ).flow
+    }.cachedIn(viewModelScope)
+
+data class Quadruple<out A, out B, out C, out D>(
+    val first: A,
+    val second: B,
+    val third: C,
+    val fourth: D
+)
+
     fun updatePhotoDetails(photo: PhotoEntity, groupId: Long = 0) {
         viewModelScope.launch(Dispatchers.IO) {
             val existing = photoDao.getPhotoByPath(photo.filePath)
@@ -504,98 +530,125 @@ class PhotoViewModel(
         }
     }
 
-    suspend fun registerPhotosWithAutoEvent(photoItems: List<LocalPhotoItem>, context: Context) = withContext(Dispatchers.IO) {
+    suspend fun registerPhotosWithAutoEvent(
+        photoItems: List<LocalPhotoItem>, 
+        context: Context,
+        lastScanTime: Long = 0L
+    ) = withContext(Dispatchers.IO) {
+        // 前回のスキャンより新しい写真、またはDBに未登録の写真のみを対象にする
+        val targetItems = photoItems.filter { it.dateAdded > lastScanTime }
+        if (targetItems.isEmpty()) return@withContext
+
         val allEvents = eventDao.getAllEventsOnce()
         val allDbPhotos = photoDao.getAllPhotosOnce().associateBy { it.filePath }
         
-        photoItems.forEach { item ->
+        val toUpdate = mutableListOf<PhotoEntity>()
+        val toInsert = mutableListOf<PhotoEntity>()
+
+        // 高速化のため、イベントの日付をあらかじめ正規化してMap化しておく
+        val eventMap = allEvents.groupBy { it.eventDate.trim().replace("/", "-") }
+
+        targetItems.forEach { item ->
             val path = item.filePath
             val existing = allDbPhotos[path]
             
-            // 現場の自動割り付け判定
+            // 既に必要な情報が揃っている場合はスキップ（大幅な高速化）
+            // ただし、追加された日付情報が欠落している場合は更新対象とする
+            if (existing != null && existing.iso != null && existing.cameraMake != null && 
+                existing.eventId != null && existing.dateAdded != 0L) {
+                return@forEach
+            }
+
             var photoDate = item.dateStr.replace("/", "-")
             
             // EXIF情報の抽出
-            // 撮影日がズレる問題に対応するため、現場が未設定 or 整合性が不十分な場合にEXIFを優先する
-            if (existing == null || existing.iso == null || existing.cameraMake == null || existing.eventId == null) {
-                var extractedIso: Int? = null
-                var extractedFocal: Double? = null
-                var extractedAperture: Double? = null
-                var extractedSs: Double? = null
-                var extractedMake: String? = null
-                var extractedDate: String? = null
+            // (以下省略せずそのまま保持)
+            var extractedIso: Int? = null
+            var extractedFocal: Double? = null
+            var extractedAperture: Double? = null
+            var extractedSs: Double? = null
+            var extractedMake: String? = null
+            var extractedDate: String? = null
 
-                try {
-                    context.contentResolver.openInputStream(item.uri)?.use { inputStream ->
-                        val exif = ExifInterface(inputStream)
-                        extractedIso = exif.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, -1)
-                            .let { if (it == -1) exif.getAttributeInt(ExifInterface.TAG_ISO_SPEED, -1) else it }
-                            .let { if (it == -1) null else it }
-                        
-                        extractedFocal = exif.getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, -1)
-                            .let { if (it == -1) null else it.toDouble() }
-                        
-                        extractedAperture = exif.getAttributeDouble(ExifInterface.TAG_F_NUMBER, -1.0)
-                            .let { if (it <= 0) null else it }
-                        
-                        extractedSs = exif.getAttributeDouble(ExifInterface.TAG_EXPOSURE_TIME, -1.0)
-                            .let { if (it <= 0) null else it }
-                        
-                        extractedMake = (exif.getAttribute(ExifInterface.TAG_MAKE) ?: exif.getAttribute(ExifInterface.TAG_MODEL))?.trim()
+            try {
+                context.contentResolver.openInputStream(item.uri)?.use { inputStream ->
+                    val exif = ExifInterface(inputStream)
+                    extractedIso = exif.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, -1)
+                        .let { if (it == -1) exif.getAttributeInt(ExifInterface.TAG_ISO_SPEED, -1) else it }
+                        .let { if (it == -1) null else it }
+                    
+                    extractedFocal = exif.getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, -1)
+                        .let { if (it == -1) null else it.toDouble() }
+                    
+                    extractedAperture = exif.getAttributeDouble(ExifInterface.TAG_F_NUMBER, -1.0)
+                        .let { if (it <= 0) null else it }
+                    
+                    extractedSs = exif.getAttributeDouble(ExifInterface.TAG_EXPOSURE_TIME, -1.0)
+                        .let { if (it <= 0) null else it }
+                    
+                    extractedMake = (exif.getAttribute(ExifInterface.TAG_MAKE) ?: exif.getAttribute(ExifInterface.TAG_MODEL))?.trim()
 
-                        val exifDate = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                            ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
-                        if (exifDate != null) {
-                            extractedDate = exifDate.substringBefore(" ").replace(":", "-")
-                        }
+                    val exifDate = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                        ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+                    if (exifDate != null) {
+                        extractedDate = exifDate.substringBefore(" ").replace(":", "-")
                     }
-                } catch (e: Exception) { }
+                }
+            } catch (e: Exception) { }
 
-                if (extractedDate != null) {
-                    photoDate = extractedDate!!
+            if (extractedDate != null) {
+                photoDate = extractedDate!!
+            }
+
+            // Mapから高速に検索
+            val matchingEventId = eventMap[photoDate]?.firstOrNull()?.id
+
+            if (existing == null) {
+                toInsert.add(PhotoEntity(
+                    filePath = path, 
+                    fileType = item.fileType, 
+                    status = PhotoStatus.SHOT.name, 
+                    eventId = matchingEventId,
+                    iso = extractedIso,
+                    focalLength = extractedFocal,
+                    aperture = extractedAperture,
+                    shutterSpeed = extractedSs,
+                    cameraMake = extractedMake,
+                    dateAdded = item.dateAdded,
+                    dateTaken = item.dateTaken,
+                    dateModified = item.dateModified
+                ))
+            } else {
+                // 撮影日と現場の日付が一致しているか厳格にチェック
+                val currentEvent = allEvents.find { it.id == existing.eventId }
+                val currentEventDate = currentEvent?.eventDate?.trim()?.replace("/", "-")
+                
+                val finalEventId = if (currentEventDate != null && currentEventDate != photoDate) {
+                    matchingEventId
+                } else {
+                    existing.eventId ?: matchingEventId
                 }
 
-                val matchingEventId = allEvents.find { 
-                    val eventDate = it.eventDate.trim().replace("/", "-")
-                    eventDate.isNotEmpty() && eventDate == photoDate
-                }?.id
-
-                if (existing == null) {
-                    photoDao.insertPhoto(PhotoEntity(
-                        filePath = path, 
-                        fileType = item.fileType, 
-                        status = PhotoStatus.SHOT.name, 
-                        eventId = matchingEventId,
-                        iso = extractedIso,
-                        focalLength = extractedFocal,
-                        aperture = extractedAperture,
-                        shutterSpeed = extractedSs,
-                        cameraMake = extractedMake
-                    ))
-                } else {
-                    // 撮影日と現場の日付が一致しているか厳格にチェック
-                    val currentEvent = allEvents.find { it.id == existing.eventId }
-                    val currentEventDate = currentEvent?.eventDate?.trim()?.replace("/", "-")
-                    
-                    val finalEventId = if (currentEventDate != null && currentEventDate != photoDate) {
-                        // 日付が一致しない場合（イベントを消した、または間違って紐付いた）
-                        // 正しい日付のイベントがあればそこへ、なければ未割り当て(null)に強制移動
-                        matchingEventId
-                    } else {
-                        existing.eventId ?: matchingEventId
-                    }
-
-                    photoDao.updatePhoto(existing.copy(
-                        eventId = finalEventId,
-                        iso = existing.iso ?: extractedIso,
-                        focalLength = existing.focalLength ?: extractedFocal,
-                        aperture = existing.aperture ?: extractedAperture,
-                        shutterSpeed = existing.shutterSpeed ?: extractedSs,
-                        cameraMake = existing.cameraMake ?: extractedMake
-                    ))
+                val updated = existing.copy(
+                    eventId = finalEventId,
+                    iso = existing.iso ?: extractedIso,
+                    focalLength = existing.focalLength ?: extractedFocal,
+                    aperture = existing.aperture ?: extractedAperture,
+                    shutterSpeed = existing.shutterSpeed ?: extractedSs,
+                    cameraMake = existing.cameraMake ?: extractedMake,
+                    dateAdded = if (existing.dateAdded == 0L) item.dateAdded else existing.dateAdded,
+                    dateTaken = existing.dateTaken ?: item.dateTaken,
+                    dateModified = existing.dateModified ?: item.dateModified
+                )
+                if (updated != existing) {
+                    toUpdate.add(updated)
                 }
             }
         }
+
+        // まとめて書き込み（DBアクセスの劇的な削減）
+        if (toInsert.isNotEmpty()) photoDao.insertPhotos(toInsert)
+        if (toUpdate.isNotEmpty()) photoDao.updatePhotos(toUpdate)
     }
 
     fun addEvent(event: EventEntity, currentPhotos: List<LocalPhotoItem>) {
@@ -1080,16 +1133,32 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
             if (viewModel.localPhotos.isEmpty()) {
                 viewModel.isRefreshing = true
 
+                val prefs = context.getSharedPreferences("kameko_prefs", Context.MODE_PRIVATE)
+                val lastScanTime = prefs.getLong("last_scan_time", 0L)
+                var maxDateAdded = lastScanTime
+
+                // 起動時はUI表示を最優先
+                val allPhotos = mutableListOf<LocalPhotoItem>()
                 loadPhotosWithMimeStreaming(context) { batch ->
-                    val currentUris = viewModel.localPhotos.map { it.uri.toString() }.toSet()
-                    val uniqueBatch = batch.filter { it.uri.toString() !in currentUris }
-                    if (uniqueBatch.isNotEmpty()) {
-                        viewModel.localPhotos = viewModel.localPhotos + uniqueBatch
+                    allPhotos.addAll(batch)
+                    viewModel.localPhotos = allPhotos.toList()
+                    
+                    // 最初の1バッチ（100枚）が出たら、ユーザーが待たされている感を減らすためにバーを早めに消す検討
+                    if (allPhotos.size >= 100) {
+                        viewModel.isRefreshing = false 
                     }
                     
-                    viewModel.registerPhotosWithAutoEvent(batch, context)
+                    batch.forEach { if (it.dateAdded > maxDateAdded) maxDateAdded = it.dateAdded }
                 }
-                viewModel.isRefreshing = false
+                
+                // 全件ロード完了後にバックグラウンドで解析
+                scope.launch(Dispatchers.IO) {
+                    viewModel.registerPhotosWithAutoEvent(allPhotos, context, lastScanTime)
+                    prefs.edit().putLong("last_scan_time", maxDateAdded).apply()
+                    withContext(Dispatchers.Main) {
+                        viewModel.isRefreshing = false // 念のため最後にも消す
+                    }
+                }
             }
         }
     }
@@ -1117,13 +1186,21 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                     // 1. UIをまず更新
                     viewModel.localPhotos = latestPhotos
 
-                    // 2. 新規写真をDBに登録
-                    viewModel.registerPhotosWithAutoEvent(latestPhotos, context)
-                    
-                    delay(300)
-                    viewModel.isRefreshing = false
+                    // 2. 解析はバックグラウンドで（UIをブロックしない）
+                    scope.launch(Dispatchers.IO) {
+                        val prefs = context.getSharedPreferences("kameko_prefs", Context.MODE_PRIVATE)
+                        val lastScanTime = if (isForce) 0L else prefs.getLong("last_scan_time", 0L)
+                        
+                        viewModel.registerPhotosWithAutoEvent(latestPhotos, context, lastScanTime)
+                        
+                        val maxAdded = latestPhotos.maxOfOrNull { it.dateAdded } ?: 0L
+                        prefs.edit().putLong("last_scan_time", maxAdded).apply()
+
+                        withContext(Dispatchers.Main) {
+                            viewModel.isRefreshing = false
+                        }
+                    }
                 } else {
-                    delay(300)
                     viewModel.isRefreshing = false
                 }
             }
@@ -1164,84 +1241,20 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val filteredPhotoItems = remember(
-        viewModel.localPhotos, viewModel.searchQuery, viewModel.selectedStatusFilter, 
-        viewModel.selectedTypeFilter, viewModel.selectedEventFilterId, viewModel.selectedMakeFilter,
-        viewModel.selectedIsoFilter, viewModel.selectedFocalFilter, viewModel.selectedSsFilter, viewModel.selectedApertureFilter,
-        viewModel.selectedSortType,
-        dbPhotoMap, dbEvents
-    ) {
-        val selectedEvent = dbEvents.find { it.id == viewModel.selectedEventFilterId }
-
-        val filtered = viewModel.localPhotos.filter { item ->
-            val dbPhoto = dbPhotoMap[item.filePath]
-
-            // 現場フィルタの判定
-            val matchesEvent = when {
-                viewModel.selectedEventFilterId == null -> true
-                // 1. DB上で明示的にこの現場に紐付いている場合のみOK
-                dbPhoto?.eventId == viewModel.selectedEventFilterId -> true
-                else -> false
-            }
-
-            val matchesSearch = viewModel.searchQuery.isBlank() ||
-                    item.filePath.contains(viewModel.searchQuery, ignoreCase = true) ||
-                    (dbPhoto?.memo?.contains(viewModel.searchQuery, ignoreCase = true) == true)
-            val matchesStatus = viewModel.selectedStatusFilter == "ALL" ||
-                    (dbPhoto?.status ?: "SHOT") == viewModel.selectedStatusFilter
-            val matchesType = viewModel.selectedTypeFilter == "ALL" ||
-                    (dbPhoto?.fileType ?: item.fileType) == viewModel.selectedTypeFilter
-            
-            // 機材フィルタの判定
-            val matchesMake = viewModel.selectedMakeFilter == null || 
-                              (dbPhoto?.cameraMake ?: item.cameraMake)?.contains(viewModel.selectedMakeFilter!!, ignoreCase = true) == true
-
-            // 撮影設定フィルタの判定
-            val iso = dbPhoto?.iso ?: -1
-            val matchesIso = when(viewModel.selectedIsoFilter) {
-                "LOW" -> iso in 1..400
-                "MID" -> iso in 401..3200
-                "HIGH" -> iso > 3200
-                else -> true
-            }
-
-            val focal = dbPhoto?.focalLength ?: -1.0
-            val matchesFocal = when(viewModel.selectedFocalFilter) {
-                "U-WIDE" -> focal in 1.0..23.9
-                "WIDE" -> focal in 24.0..35.0
-                "STD" -> focal in 35.1..70.0
-                "TELE" -> focal in 70.1..200.0
-                "S-TELE" -> focal > 200.0
-                else -> true
-            }
-
-            val ss = dbPhoto?.shutterSpeed ?: -1.0
-            val matchesSs = when(viewModel.selectedSsFilter) {
-                "FAST" -> ss in 0.0..0.002 // <= 1/500
-                "MID" -> ss in 0.0021..0.0333 // 1/500 ~ 1/30
-                "SLOW" -> ss > 0.0333 // > 1/30
-                else -> true
-            }
-
-            val f = dbPhoto?.aperture ?: -1.0
-            val matchesAperture = when(viewModel.selectedApertureFilter) {
-                "OPEN" -> f in 1.0..2.8
-                "MID" -> f in 2.81..8.0
-                "CLOSED" -> f > 8.0
-                else -> true
-            }
-
-            matchesSearch && matchesStatus && matchesType && matchesEvent && matchesMake && 
-            matchesIso && matchesFocal && matchesSs && matchesAperture
-        }
-
-        val sorted = when (viewModel.selectedSortType) {
-            PhotoSortType.DATE_TAKEN -> filtered.sortedByDescending { it.dateTaken }
-            PhotoSortType.DATE_MODIFIED -> filtered.sortedByDescending { it.dateModified }
-            else -> filtered.sortedByDescending { it.dateAdded }
-        }
-
-        sorted.distinctBy { it.uri.toString() }
+    val pagedPhotos = viewModel.pagedPhotos.collectAsLazyPagingItems()
+    
+    // UI表示用の変換（Pagingから取得したPhotoEntityをLocalPhotoItemに見せかける）
+    fun PhotoEntity.toLocalPhotoItem(context: Context): LocalPhotoItem {
+        return LocalPhotoItem(
+            uri = Uri.parse(this.filePath.let { if (it.startsWith("/")) "file://$it" else it }),
+            filePath = this.filePath,
+            fileType = this.fileType,
+            dateTaken = 0L,
+            dateModified = 0L,
+            dateAdded = 0L,
+            dateStr = "",
+            cameraMake = this.cameraMake
+        )
     }
 
     // 共有後の投稿確認ダイアログ
@@ -1932,7 +1945,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
 
                         // グリッド表示エリア
                         Box(modifier = Modifier.fillMaxSize().weight(1f)) {
-                            if (filteredPhotoItems.isEmpty()) {
+                            if (pagedPhotos.itemCount == 0) {
                                 if (!viewModel.isRefreshing) {
                                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                         Text("No photos found", color = Color.Gray)
@@ -1947,14 +1960,14 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                                     verticalArrangement = Arrangement.spacedBy(2.dp)
                                 ) {
-                                    items(filteredPhotoItems, key = { it.uri.toString() }) { item ->
-                                        val pathString = item.filePath
-                                        val dbPhoto = dbPhotoMap[pathString]
+                                    items(pagedPhotos.itemCount, key = { index -> pagedPhotos[index]?.id ?: index }) { index ->
+                                        val photo = pagedPhotos[index] ?: return@items
+                                        val item = photo.toLocalPhotoItem(context)
                                         val isSelected = selectedUris.contains(item.uri)
 
                                         ModernPhotoItem(
                                             item = item,
-                                            dbPhoto = dbPhoto,
+                                            dbPhoto = photo,
                                             isSelected = isSelected,
                                             isSelectionMode = selectedUris.isNotEmpty(),
                                             onClick = {
@@ -1969,7 +1982,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                                         selectedUris = selectedUris + item.uri
                                                     }
                                                 } else {
-                                                    selectedPhotoIndex = filteredPhotoItems.indexOf(item)
+                                                    selectedPhotoIndex = index // Pagingのインデックスを使用
                                                 }
                                             },
                                             onLongClick = {
@@ -2166,27 +2179,25 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
         exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(targetOffsetY = { it / 2 })
     ) {
         val index = selectedPhotoIndex ?: return@AnimatedVisibility
+        val photo = pagedPhotos[index] ?: return@AnimatedVisibility
+        val item = photo.toLocalPhotoItem(context)
 
-        PhotoDetailView(
-            allPhotos = filteredPhotoItems,
+        PhotoDetailViewPaged(
+            pagedPhotos = pagedPhotos,
             initialIndex = index,
-            dbPhotoMap = dbPhotoMap,
             events = dbEvents,
             onDismiss = { selectedPhotoIndex = null },
             onSaveStatus = { photoEntity, status, eventId, memo ->
                 viewModel.updatePhotoDetails(photoEntity.copy(status = status, eventId = eventId, memo = memo))
-                // 保存しても画面は閉じず、スライドを続けられるようにする
             },
             onShare = { photoEntity, localPhoto, packageId ->
                 scope.launch(Dispatchers.IO) {
                     try {
                         val shareUri = prepareShareUri(context, photoEntity.filePath, localPhoto.uri)
-
                         withContext(Dispatchers.Main) {
                             shareToPackage(context, packageId, listOf(shareUri), photoEntity.memo) {
                                 viewModel.savePendingPhotos(listOf(photoEntity))
                                 viewModel.shareActionStarted = true
-                                // 共有開始後も画面を閉じず、戻ってきたときにそのまま確認できるようにする
                             }
                         }
                     } catch (e: Exception) { Log.e("KamekoPad", "Share failed", e) }
@@ -3172,18 +3183,17 @@ fun VerticalGridScrollbar(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
-fun PhotoDetailView(
-    allPhotos: List<LocalPhotoItem>,
+fun PhotoDetailViewPaged(
+    pagedPhotos: androidx.paging.compose.LazyPagingItems<PhotoEntity>,
     initialIndex: Int,
-    dbPhotoMap: Map<String, PhotoEntity>,
     events: List<EventEntity>,
     onDismiss: () -> Unit,
     onSaveStatus: (PhotoEntity, String, Long?, String) -> Unit,
     onShare: (PhotoEntity, LocalPhotoItem, String?) -> Unit
 ) {
-    val pagerState = rememberPagerState(initialPage = initialIndex, pageCount = { allPhotos.size })
+    val pagerState = rememberPagerState(initialPage = initialIndex, pageCount = { pagedPhotos.itemCount })
     val context = LocalContext.current
     val view = LocalView.current
     val scope = rememberCoroutineScope()
@@ -3208,15 +3218,25 @@ fun PhotoDetailView(
         isFullScreen = false
     }
 
-    val currentLocalPhoto = allPhotos[pagerState.currentPage]
-    val dbPhoto = dbPhotoMap[currentLocalPhoto.filePath]
-    val photoEntity = dbPhoto ?: PhotoEntity(filePath = currentLocalPhoto.filePath, fileType = currentLocalPhoto.fileType)
+    val photoEntity = pagedPhotos[pagerState.currentPage] ?: return
+    
+    // UI表示用の変換
+    val currentLocalPhoto = LocalPhotoItem(
+        uri = Uri.parse(photoEntity.filePath.let { if (it.startsWith("/")) "file://$it" else it }),
+        filePath = photoEntity.filePath,
+        fileType = photoEntity.fileType,
+        dateTaken = 0L,
+        dateModified = 0L,
+        dateAdded = 0L,
+        dateStr = "",
+        cameraMake = photoEntity.cameraMake
+    )
 
     val sdfFull = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
 
     // メタデータ解析
-    val metaData = remember(currentLocalPhoto.filePath) {
-        var name = currentLocalPhoto.filePath.substringAfterLast("/")
+    val metaData = remember(photoEntity.filePath) {
+        var name = photoEntity.filePath.substringAfterLast("/")
         var exifStr = "不明 (Exifなし)"
         var modifiedStr = "不明"
         var ss = "---"
@@ -3257,7 +3277,7 @@ fun PhotoDetailView(
             val uri = currentLocalPhoto.uri
             
             // 1. ContentResolver経由でExifを取得
-            if (currentLocalPhoto.filePath.startsWith("content://")) {
+            if (photoEntity.filePath.startsWith("content://")) {
                 context.contentResolver.openInputStream(uri)?.use { inputStream ->
                     val exif = ExifInterface(inputStream)
                     extractExif(exif)
@@ -3279,39 +3299,31 @@ fun PhotoDetailView(
                     }
                 }
             } else {
-                val file = File(currentLocalPhoto.filePath)
+                val file = File(photoEntity.filePath)
                 name = file.name
                 modifiedStr = sdfFull.format(Date(file.lastModified()))
-                val exif = ExifInterface(currentLocalPhoto.filePath)
-                extractExif(exif)
+                if (file.exists()) {
+                    val exif = ExifInterface(photoEntity.filePath)
+                    extractExif(exif)
+                }
             }
         } catch (e: Exception) {
             exifStr = "解析エラー (Exif)"
             modifiedStr = "解析エラー (File)"
         }
 
-        PhotoMetaInfo(name, exifStr, modifiedStr, ss, f, iso, focal, make ?: dbPhoto?.cameraMake)
+        PhotoMetaInfo(name, exifStr, modifiedStr, ss, f, iso, focal, make ?: photoEntity.cameraMake)
     }
 
-    val resolvedEventId = remember(currentLocalPhoto.filePath, dbPhoto?.eventId, events, metaData.exifDate) {
-        dbPhoto?.eventId ?: run {
-            // EXIFの日付を優先して候補を探す
-            val exifDateOnly = if (metaData.exifDate.contains(":")) {
-                metaData.exifDate.substringBefore(" ").replace(":", "-")
-            } else null
-            
-            val targetDate = exifDateOnly ?: currentLocalPhoto.dateStr.replace("/", "-")
-            events.find { it.eventDate.trim().replace("/", "-") == targetDate }?.id
-        }
-    }
+    val resolvedEventId = photoEntity.eventId
 
-    var selectedStatus by remember(currentLocalPhoto.filePath, dbPhoto?.status) {
-        mutableStateOf(dbPhoto?.status ?: "SHOT")
+    var selectedStatus by remember(photoEntity.filePath, photoEntity.status) {
+        mutableStateOf(photoEntity.status)
     }
-    var memoText by remember(currentLocalPhoto.filePath, dbPhoto?.memo) {
-        mutableStateOf(dbPhoto?.memo ?: "")
+    var memoText by remember(photoEntity.filePath, photoEntity.memo) {
+        mutableStateOf(photoEntity.memo ?: "")
     }
-    var selectedEventId by remember(currentLocalPhoto.filePath, resolvedEventId) {
+    var selectedEventId by remember(photoEntity.filePath, resolvedEventId) {
         mutableStateOf(resolvedEventId)
     }
 
@@ -3322,10 +3334,10 @@ fun PhotoDetailView(
 
     Scaffold(
         topBar = {
-            AnimatedVisibility(
+            androidx.compose.animation.AnimatedVisibility(
                 visible = !isFullScreen,
-                enter = fadeIn(),
-                exit = fadeOut()
+                enter = androidx.compose.animation.fadeIn(),
+                exit = androidx.compose.animation.fadeOut()
             ) {
                 TopAppBar(
                     title = { },
@@ -3352,20 +3364,19 @@ fun PhotoDetailView(
         ) {
             HorizontalPager(
                 state = pagerState,
-                userScrollEnabled = true, // 常に有効にする（内部の拡大状態で制御）
+                userScrollEnabled = true,
                 modifier = Modifier
                     .fillMaxWidth()
                     .then(if (isFullScreen) Modifier.weight(1f) else Modifier.height(450.dp))
                     .background(Color.Black)
             ) { page ->
-                val photo = allPhotos[page]
+                val pEntity = pagedPhotos[page] ?: return@HorizontalPager
+                val pUri = Uri.parse(pEntity.filePath.let { if (it.startsWith("/")) "file://$it" else it })
                 
-                // ズームとスワイプのための状態
                 var scale by remember { mutableStateOf(1f) }
                 var offset by remember { mutableStateOf(Offset.Zero) }
                 var swipeOffset by remember { mutableStateOf(0f) }
 
-                // ページが切り替わった時、または全画面表示が解除された時にズームをリセット
                 LaunchedEffect(pagerState.currentPage, isFullScreen) {
                     if (!isFullScreen || pagerState.currentPage != page) {
                         scale = 1f
@@ -3379,39 +3390,26 @@ fun PhotoDetailView(
                         .fillMaxSize()
                         .pointerInput(isFullScreen, scale) {
                             if (!isFullScreen) return@pointerInput
-                            
-                            // 手動でジェスチャーを制御して Pager との競合を防ぐ
                             awaitPointerEventScope {
                                 while (true) {
                                     val event = awaitPointerEvent()
                                     val zoomChange = event.calculateZoom()
                                     val panChange = event.calculatePan()
-                                    
                                     if (scale > 1.05f || zoomChange != 1f) {
-                                        // 拡大中またはピンチ操作開始：すべてのイベントを消費してズーム/パンを行う
                                         scale = (scale * zoomChange).coerceIn(1f, 5f)
                                         offset += panChange
                                         event.changes.forEach { it.consume() }
                                     } else {
-                                        // 等倍時：1本指の操作
                                         val dragAmount = panChange
                                         if (kotlin.math.abs(dragAmount.y) > kotlin.math.abs(dragAmount.x) && kotlin.math.abs(dragAmount.y) > 0) {
-                                            // 縦方向の動きが支配的な場合のみ消費して下スワイプ処理へ
                                             swipeOffset += dragAmount.y
                                             if (swipeOffset < 0) swipeOffset = 0f
                                             event.changes.forEach { it.consume() }
-                                        } else {
-                                            // 横方向の動き、または動きがない場合は消費しない
-                                            // これによりイベントが HorizontalPager に伝わり、ページめくりができる
                                         }
                                     }
-
-                                    // 指が離された時の判定
                                     if (event.changes.all { !it.pressed }) {
                                         if (scale <= 1.05f) {
-                                            if (swipeOffset > 400f) {
-                                                onDismiss()
-                                            }
+                                            if (swipeOffset > 400f) onDismiss()
                                             swipeOffset = 0f
                                             offset = Offset.Zero
                                         }
@@ -3429,7 +3427,7 @@ fun PhotoDetailView(
                         .clickable { isFullScreen = !isFullScreen }
                 ) {
                     AsyncImage(
-                        model = photo.uri,
+                        model = pUri,
                         contentDescription = null,
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Fit
@@ -3438,10 +3436,10 @@ fun PhotoDetailView(
             }
 
             // --- ② 操作・情報エリア ---
-            AnimatedVisibility(
+            androidx.compose.animation.AnimatedVisibility(
                 visible = !isFullScreen,
-                enter = fadeIn(),
-                exit = fadeOut()
+                enter = androidx.compose.animation.fadeIn(),
+                exit = androidx.compose.animation.fadeOut()
             ) {
                 Column(
                     modifier = Modifier
@@ -3472,7 +3470,7 @@ fun PhotoDetailView(
                             }
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Icon(Icons.Default.Info, null, modifier = Modifier.size(14.dp), tint = Color.Gray)
-                                Text("TYPE: ${currentLocalPhoto.fileType}", fontSize = 11.sp, color = Color.Gray, letterSpacing = 0.5.sp)
+                                Text("TYPE: ${photoEntity.fileType}", fontSize = 11.sp, color = Color.Gray, letterSpacing = 0.5.sp)
                             }
                             metaData.cameraMake?.let {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -3495,7 +3493,6 @@ fun PhotoDetailView(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                // 露出3点セット
                                 listOf(
                                     "SS" to metaData.shutterSpeed,
                                     "F" to metaData.aperture,
@@ -3518,7 +3515,6 @@ fun PhotoDetailView(
                                 }
                             }
 
-                            // 焦点距離は別行で詳しく
                             Surface(
                                 modifier = Modifier.fillMaxWidth(),
                                 color = Color.White,
@@ -3538,10 +3534,7 @@ fun PhotoDetailView(
                     }
                 }
 
-                // 現場選択セクション
-                val currentEvent = remember(selectedEventId, events) {
-                    events.find { it.id == selectedEventId }
-                }
+                val currentEvent = remember(selectedEventId, events) { events.find { it.id == selectedEventId } }
 
                 OutlinedCard(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -3551,74 +3544,31 @@ fun PhotoDetailView(
                     Column(modifier = Modifier.padding(16.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Icon(Icons.Default.Info, null, modifier = Modifier.size(14.dp), tint = Color.Gray)
-                            Text(
-                                text = "EVENT LINK",
-                                fontSize = 10.sp,
-                                color = Color.Gray,
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 1.sp
-                            )
+                            Text(text = "EVENT LINK", fontSize = 10.sp, color = Color.Gray, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                         }
                         Spacer(modifier = Modifier.height(8.dp))
 
                         var expandedEvent by remember { mutableStateOf(false) }
-
-                        ExposedDropdownMenuBox(
-                            expanded = expandedEvent,
-                            onExpandedChange = { expandedEvent = !expandedEvent }
-                        ) {
+                        ExposedDropdownMenuBox(expanded = expandedEvent, onExpandedChange = { expandedEvent = !expandedEvent }) {
                             OutlinedTextField(
-                                value = currentEvent?.let { "${it.eventDate} ${it.name} (${it.venue})" } ?: "⚠️ 現場未割り付け (自動判定なし)",
+                                value = currentEvent?.let { "${it.eventDate} ${it.name} (${it.venue})" } ?: "⚠️ 現場未割り付け",
                                 onValueChange = {},
                                 readOnly = true,
                                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedEvent) },
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                    unfocusedBorderColor = Color.LightGray,
-                                    focusedTextColor = if (currentEvent != null) Color.Black else Color.Red,
-                                    unfocusedTextColor = if (currentEvent != null) Color.Black else Color.Red
-                                ),
                                 modifier = Modifier.fillMaxWidth().menuAnchor(),
-                                textStyle = androidx.compose.ui.text.TextStyle(
-                                    fontWeight = if (currentEvent != null) FontWeight.Bold else FontWeight.Normal,
-                                    fontSize = 14.sp
-                                )
+                                textStyle = androidx.compose.ui.text.TextStyle(fontWeight = if (currentEvent != null) FontWeight.Bold else FontWeight.Normal, fontSize = 14.sp)
                             )
-
-                            ExposedDropdownMenu(
-                                expanded = expandedEvent,
-                                onDismissRequest = { expandedEvent = false }
-                            ) {
-                                DropdownMenuItem(
-                                    text = { Text("❌ 現場の紐付けを解除（未割り付けにする）", color = Color.Red, fontSize = 14.sp) },
-                                    onClick = {
-                                        selectedEventId = null
-                                        expandedEvent = false
-                                        // 現場解除を即時反映
-                                        onSaveStatus(photoEntity, selectedStatus, null, memoText)
-                                    }
-                                )
-                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
-
+                            ExposedDropdownMenu(expanded = expandedEvent, onDismissRequest = { expandedEvent = false }) {
+                                DropdownMenuItem(text = { Text("❌ 解除", color = Color.Red) }, onClick = { selectedEventId = null; expandedEvent = false; onSaveStatus(photoEntity, selectedStatus, null, memoText) })
                                 sortedEvents.forEach { event ->
                                     DropdownMenuItem(
                                         text = {
                                             Column {
-                                                Text(event.eventDate, fontSize = 10.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-                                                Text(event.name, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                                    Icon(Icons.Default.Place, null, tint = Color.Gray, modifier = Modifier.size(12.dp))
-                                                    Spacer(Modifier.width(4.dp))
-                                                    Text(event.venue, fontSize = 12.sp, color = Color.Gray)
-                                                }
+                                                Text(event.eventDate, fontSize = 10.sp, color = MaterialTheme.colorScheme.primary)
+                                                Text(event.name, fontWeight = FontWeight.Bold)
                                             }
                                         },
-                                        onClick = {
-                                            selectedEventId = event.id
-                                            expandedEvent = false
-                                            // 現場選択を即時反映
-                                            onSaveStatus(photoEntity, selectedStatus, event.id, memoText)
-                                        }
+                                        onClick = { selectedEventId = event.id; expandedEvent = false; onSaveStatus(photoEntity, selectedStatus, event.id, memoText) }
                                     )
                                 }
                             }
@@ -3626,79 +3576,18 @@ fun PhotoDetailView(
                     }
                 }
 
-                // ステータス変更
-                Text("ステータス変更", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Black)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf("SHOT" to "SHOT", "FAVORITE" to "FAV", "POSTED" to "POST").forEach { (statusKey, label) ->
-                        val isSelected = selectedStatus == statusKey
-                        FilterChip(
-                            selected = isSelected,
-                            onClick = { 
-                                selectedStatus = statusKey
-                                // ステータス変更を即時反映
-                                onSaveStatus(photoEntity, statusKey, selectedEventId, memoText)
-                            },
-                            label = { Text(label, fontSize = 11.sp, letterSpacing = 1.sp) }
-                        )
+                        FilterChip(selected = selectedStatus == statusKey, onClick = { selectedStatus = statusKey; onSaveStatus(photoEntity, statusKey, selectedEventId, memoText) }, label = { Text(label) })
                     }
                 }
 
-                // 現像メモ
-                OutlinedTextField(
-                    value = memoText,
-                    onValueChange = { memoText = it },
-                    label = { Text("現像メモ・タグ設定") },
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 3
-                )
+                OutlinedTextField(value = memoText, onValueChange = { memoText = it }, label = { Text("メモ") }, modifier = Modifier.fillMaxWidth(), minLines = 3)
 
-                // アクションボタン
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = { onShare(photoEntity, currentLocalPhoto, null) },
-                        modifier = Modifier.weight(1f),
-                        contentPadding = PaddingValues(horizontal = 4.dp)
-                    ) {
-                        Icon(Icons.Default.Share, null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("共有", fontSize = 12.sp)
-                    }
-
-                    // X (Twitter)
-                    OutlinedButton(
-                        onClick = { onShare(photoEntity, currentLocalPhoto, "com.twitter.android") },
-                        modifier = Modifier.weight(0.8f),
-                        contentPadding = PaddingValues(horizontal = 4.dp)
-                    ) {
-                        Text("X", fontWeight = FontWeight.Black, fontSize = 14.sp)
-                    }
-
-                    // Lightroom
-                    OutlinedButton(
-                        onClick = { onShare(photoEntity, currentLocalPhoto, "com.adobe.lrmobile") },
-                        modifier = Modifier.weight(0.8f),
-                        contentPadding = PaddingValues(horizontal = 4.dp)
-                    ) {
-                        Text("Lr", fontWeight = FontWeight.Black, fontSize = 14.sp, color = Color(0xFF001E36))
-                    }
-
-                    Button(
-                        onClick = {
-                            onSaveStatus(photoEntity, selectedStatus, selectedEventId, memoText)
-                        },
-                        modifier = Modifier.weight(1.2f),
-                        contentPadding = PaddingValues(horizontal = 4.dp)
-                    ) {
-                        Text("保存", fontSize = 12.sp)
-                    }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { onShare(photoEntity, currentLocalPhoto, null) }, modifier = Modifier.weight(1f)) { Text("共有") }
+                    Button(onClick = { onSaveStatus(photoEntity, selectedStatus, selectedEventId, memoText) }, modifier = Modifier.weight(1f)) { Text("保存") }
                 }
-                
                 Spacer(modifier = Modifier.height(60.dp))
             }
         }
