@@ -16,7 +16,10 @@ data class PhotoEntity(
     val iso: Int? = null,
     val focalLength: Double? = null,
     val aperture: Double? = null,
-    val shutterSpeed: Double? = null
+    val shutterSpeed: Double? = null,
+    val dateAdded: Long = System.currentTimeMillis(),
+    val dateTaken: Long? = null,
+    val dateModified: Long? = null
 )
 
 enum class PhotoStatus {
