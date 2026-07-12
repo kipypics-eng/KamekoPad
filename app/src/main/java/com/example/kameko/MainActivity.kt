@@ -260,10 +260,10 @@ data class PostStats(val photoCount: Int, val postCount: Int)
 
 // ViewModel
 class PhotoViewModel(
-    private val photoDao: PhotoDao,
-    private val eventDao: EventDao,
-    private val historyDao: StatusHistoryDao,
-    private val savedStateHandle: SavedStateHandle
+    val photoDao: PhotoDao,
+    val eventDao: EventDao,
+    val historyDao: StatusHistoryDao,
+    val savedStateHandle: SavedStateHandle
 ) : ViewModel() {
 
     var localPhotos by mutableStateOf<List<LocalPhotoItem>>(emptyList())
@@ -358,8 +358,20 @@ class PhotoViewModel(
     }
 
     fun savePendingPhotos(photos: List<PhotoEntity>) {
-        pendingPostPhotos = photos
-        savedStateHandle["pending_photo_paths"] = photos.map { it.filePath }
+        // IDが0の場合、filePathで検索して最新の状態を取得する（DB登録直後などの不整合防止）
+        viewModelScope.launch(Dispatchers.IO) {
+            val resolvedPhotos = photos.map { photo ->
+                if (photo.id == 0L) {
+                    photoDao.getPhotoByPath(photo.filePath) ?: photo
+                } else {
+                    photo
+                }
+            }
+            withContext(Dispatchers.Main) {
+                pendingPostPhotos = resolvedPhotos
+                savedStateHandle["pending_photo_paths"] = resolvedPhotos.map { it.filePath }
+            }
+        }
     }
 
     fun completePendingPost() {
@@ -885,6 +897,7 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PhotoListScreen(viewModel: PhotoViewModel) {
+    val photoDao = viewModel.photoDao
     val photos by viewModel.photos.collectAsState()
     val dbEvents by viewModel.events.collectAsState()
     var currentTab by remember { mutableIntStateOf(0) } // 0: Gallery, 1: Timeline, 2: Stats, 3: Setting
@@ -934,12 +947,13 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
     // 複数選択アクションの共通処理
     val onMultiShare: (String?) -> Unit = { packageId ->
         val uris = selectedUris.toList()
-        val selectedPhotoEntities = uris.mapNotNull { uri ->
-            val local = viewModel.localPhotos.find { it.uri == uri }
-            local?.let { dbPhotoMap[it.filePath] ?: PhotoEntity(filePath = it.filePath, fileType = it.fileType) }
-        }
         
         scope.launch(Dispatchers.IO) {
+            val selectedPhotoEntities = uris.mapNotNull { uri ->
+                val local = viewModel.localPhotos.find { it.uri == uri }
+                local?.let { photoDao.getPhotoByPath(it.filePath) ?: PhotoEntity(filePath = it.filePath, fileType = it.fileType) }
+            }
+
             val shareableUris = uris.map { uri ->
                 val local = viewModel.localPhotos.find { it.uri == uri }
                 prepareShareUri(context, local?.filePath ?: "", uri)
@@ -958,13 +972,17 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
 
     val onMultiPost: () -> Unit = {
         val uris = selectedUris.toList()
-        val selectedPhotoEntities = uris.mapNotNull { uri ->
-            val local = viewModel.localPhotos.find { it.uri == uri }
-            local?.let { dbPhotoMap[it.filePath] ?: PhotoEntity(filePath = it.filePath, fileType = it.fileType) }
+        scope.launch(Dispatchers.IO) {
+            val selectedPhotoEntities = uris.mapNotNull { uri ->
+                val local = viewModel.localPhotos.find { it.uri == uri }
+                local?.let { photoDao.getPhotoByPath(it.filePath) ?: PhotoEntity(filePath = it.filePath, fileType = it.fileType) }
+            }
+            withContext(Dispatchers.Main) {
+                viewModel.savePendingPhotos(selectedPhotoEntities)
+                viewModel.showPostConfirmDialog = true
+                selectedUris = emptySet()
+            }
         }
-        viewModel.savePendingPhotos(selectedPhotoEntities)
-        viewModel.showPostConfirmDialog = true
-        selectedUris = emptySet()
     }
 
     // 機材フィルタ用：画像選択ランチャー
