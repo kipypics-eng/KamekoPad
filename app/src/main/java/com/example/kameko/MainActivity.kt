@@ -3022,9 +3022,9 @@ fun ModernPhotoItem(
     val lightweightLoader = remember { getLightweightImageLoader(context) }
 
     // 解像度を320pxに制限し、キャッシュの再利用を優先
-    val imageRequest = remember(item.uri) {
+    val imageRequest = remember(item.filePath) {
         ImageRequest.Builder(context)
-            .data(item.uri)
+            .data(MediaThumb(item.filePath)) // OSのサムネイルを利用して高速表示
             .size(320)
             .precision(Precision.INEXACT)
             .build()
@@ -3669,11 +3669,10 @@ fun GroupedHistoryItem(
 @Composable
 fun HistorySmallThumbnail(filePath: String) {
     val context = LocalContext.current
-    val uri = Uri.parse(filePath)
     val lightweightLoader = remember { getLightweightImageLoader(context) }
-    val imageRequest = remember(uri) {
+    val imageRequest = remember(filePath) {
         ImageRequest.Builder(context)
-            .data(uri)
+            .data(MediaThumb(filePath))
             .size(100, 100)
             .build()
     }
@@ -3710,11 +3709,10 @@ fun HistoryThumbnailItem(history: StatusHistoryEntity, sdfFull: SimpleDateFormat
         } catch (e: Exception) { }
         name
     }
-    val uri = Uri.parse(history.photoFilePath)
     val lightweightLoader = remember { getLightweightImageLoader(context) }
-    val imageRequest = remember(uri) {
+    val imageRequest = remember(history.photoFilePath) {
         ImageRequest.Builder(context)
-            .data(uri)
+            .data(MediaThumb(history.photoFilePath))
             .crossfade(true)
             .size(120, 120)
             .build()
@@ -4057,6 +4055,11 @@ fun getLightweightImageLoader(context: Context): ImageLoader {
                 .directory(context.applicationContext.cacheDir.resolve("image_cache"))
                 .maxSizePercent(0.1) // ディスクキャッシュを10%に設定
                 .build()
+        }
+        .components {
+            // MediaStoreのサムネイルを使うFetcher（元画像のフルデコードを回避）
+            add(MediaThumbKeyer())
+            add(MediaThumbFetcher.Factory())
         }
         .crossfade(false) // フェードをオフ
         .build().also { _lightweightImageLoader = it }
