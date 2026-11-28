@@ -23,6 +23,10 @@ interface EventDao {
     @Query("SELECT * FROM events WHERE name = :name AND venue = :venue AND eventDate = :date LIMIT 1")
     suspend fun findEvent(name: String, venue: String, date: String): EventEntity?
 
+    /** 既存イベントの更新用。REPLACE だと行が削除→再挿入され、出演者の紐づけが CASCADE で消えるため */
+    @androidx.room.Update
+    suspend fun update(event: EventEntity)
+
     @androidx.room.Delete
     suspend fun delete(event: EventEntity)
 }

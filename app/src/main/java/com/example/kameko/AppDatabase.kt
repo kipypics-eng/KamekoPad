@@ -11,15 +11,19 @@ import androidx.sqlite.db.SupportSQLiteDatabase
     entities = [
         PhotoEntity::class,
         EventEntity::class,
-        StatusHistoryEntity::class
+        StatusHistoryEntity::class,
+        ArtistEntity::class,
+        EventArtistCrossRef::class,
+        PhotoArtistCrossRef::class
     ],
-    version = 7,
+    version = 8,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun photoDao(): PhotoDao
     abstract fun eventDao(): EventDao
     abstract fun statusHistoryDao(): StatusHistoryDao
+    abstract fun artistDao(): ArtistDao
 
     companion object {
         @Volatile private var INSTANCE: AppDatabase? = null
@@ -29,6 +33,33 @@ abstract class AppDatabase : RoomDatabase() {
                 db.execSQL("ALTER TABLE photos ADD COLUMN dateAdded INTEGER NOT NULL DEFAULT 0")
                 db.execSQL("ALTER TABLE photos ADD COLUMN dateTaken INTEGER")
                 db.execSQL("ALTER TABLE photos ADD COLUMN dateModified INTEGER")
+            }
+        }
+
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS `artists` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL)")
+                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_artists_name` ON `artists` (`name`)")
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `event_artists` (
+                        `eventId` INTEGER NOT NULL,
+                        `artistId` INTEGER NOT NULL,
+                        PRIMARY KEY(`eventId`, `artistId`),
+                        FOREIGN KEY(`eventId`) REFERENCES `events`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE,
+                        FOREIGN KEY(`artistId`) REFERENCES `artists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                """)
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_event_artists_artistId` ON `event_artists` (`artistId`)")
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS `photo_artists` (
+                        `photoId` INTEGER NOT NULL,
+                        `artistId` INTEGER NOT NULL,
+                        PRIMARY KEY(`photoId`, `artistId`),
+                        FOREIGN KEY(`photoId`) REFERENCES `photos`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE,
+                        FOREIGN KEY(`artistId`) REFERENCES `artists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                """)
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_photo_artists_artistId` ON `photo_artists` (`artistId`)")
             }
         }
 
@@ -73,7 +104,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "kameko_database"
                 )
-                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
                     .fallbackToDestructiveMigration(dropAllTables = true)
                     .build().also { INSTANCE = it }
             }

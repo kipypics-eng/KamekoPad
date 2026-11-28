@@ -18,6 +18,11 @@ interface PhotoDao {
         AND (:type = 'ALL' OR fileType = :type)
         AND (:eventId IS NULL OR eventId = :eventId)
         AND (:make IS NULL OR cameraMake = :make)
+        AND (
+            :artistId IS NULL
+            OR (:artistId = -1 AND NOT EXISTS (SELECT 1 FROM photo_artists pa WHERE pa.photoId = photos.id))
+            OR EXISTS (SELECT 1 FROM photo_artists pa WHERE pa.photoId = photos.id AND pa.artistId = :artistId)
+        )
         ORDER BY 
             CASE :sortType
                 WHEN 'DATE_ADDED' THEN dateAdded
@@ -32,6 +37,7 @@ interface PhotoDao {
         type: String,
         eventId: Long?,
         make: String?,
+        artistId: Long?,
         sortType: String
     ): PagingSource<Int, PhotoEntity>
 
@@ -39,10 +45,10 @@ interface PhotoDao {
     suspend fun getAllPhotosOnce(): List<PhotoEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertPhoto(photo: PhotoEntity)
+    suspend fun insertPhoto(photo: PhotoEntity): Long
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertPhotos(photos: List<PhotoEntity>)
+    suspend fun insertPhotos(photos: List<PhotoEntity>): List<Long>
 
     @Update
     suspend fun updatePhoto(photo: PhotoEntity)
