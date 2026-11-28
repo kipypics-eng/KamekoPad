@@ -624,7 +624,7 @@ private data class GalleryQuery(
     }
 
     suspend fun registerPhotosWithAutoEvent(
-        photoItems: List<LocalPhotoItem>, 
+        photoItems: List<LocalPhotoItem>,
         context: Context,
         lastScanTime: Long = 0L
     ) = withContext(Dispatchers.IO) {
@@ -633,120 +633,145 @@ private data class GalleryQuery(
         if (targetItems.isEmpty()) return@withContext
 
         val allEvents = eventDao.getAllEventsOnce()
+        val eventById = allEvents.associateBy { it.id }
         val allDbPhotos = photoDao.getAllPhotosOnce().associateBy { it.filePath }
-        
-        val toUpdate = mutableListOf<PhotoEntity>()
-        val toInsert = mutableListOf<PhotoEntity>()
-        val eventChangedIds = mutableListOf<Long>()
 
         // 高速化のため、イベントの日付をあらかじめ正規化してMap化しておく
         val eventMap = allEvents.groupBy { it.eventDate.trim().replace("/", "-") }
 
-        targetItems.forEach { item ->
-            val path = item.filePath
-            val existing = allDbPhotos[path]
-            
-            // 既に必要な情報が揃っている場合はスキップ（大幅な高速化）
-            // ただし、追加された日付情報が欠落している場合は更新対象とする
-            if (existing != null && existing.iso != null && existing.cameraMake != null && 
-                existing.eventId != null && existing.dateAdded != 0L) {
-                return@forEach
-            }
+        // EXIF読み込みは同時4件まで並列化（多すぎるとサムネイル表示と競合するため）
+        val exifDispatcher = Dispatchers.IO.limitedParallelism(4)
 
-            var photoDate = item.dateStr.replace("/", "-")
-            
-            // EXIF情報の抽出
-            // (以下省略せずそのまま保持)
-            var extractedIso: Int? = null
-            var extractedFocal: Double? = null
-            var extractedAperture: Double? = null
-            var extractedSs: Double? = null
-            var extractedMake: String? = null
-            var extractedDate: String? = null
-
-            try {
-                context.contentResolver.openInputStream(item.uri)?.use { inputStream ->
-                    val exif = ExifInterface(inputStream)
-                    extractedIso = exif.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, -1)
-                        .let { if (it == -1) exif.getAttributeInt(ExifInterface.TAG_ISO_SPEED, -1) else it }
-                        .let { if (it == -1) null else it }
-                    
-                    extractedFocal = exif.getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, -1)
-                        .let { if (it == -1) null else it.toDouble() }
-                    
-                    extractedAperture = exif.getAttributeDouble(ExifInterface.TAG_F_NUMBER, -1.0)
-                        .let { if (it <= 0) null else it }
-                    
-                    extractedSs = exif.getAttributeDouble(ExifInterface.TAG_EXPOSURE_TIME, -1.0)
-                        .let { if (it <= 0) null else it }
-                    
-                    extractedMake = (exif.getAttribute(ExifInterface.TAG_MAKE) ?: exif.getAttribute(ExifInterface.TAG_MODEL))?.trim()
-
-                    val exifDate = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                        ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
-                    if (exifDate != null) {
-                        extractedDate = exifDate.substringBefore(" ").replace(":", "-")
+        // 200枚ずつ処理してDBへ書き込む。
+        // ・新しい写真が少しずつ一覧に出てくる（全件解析完了を待たない）
+        // ・途中でアプリが終了しても、処理済みの分は次回スキップされる
+        targetItems.chunked(200).forEach { chunk ->
+            val results = coroutineScope {
+                chunk.map { item ->
+                    async(exifDispatcher) {
+                        buildRegisteredPhoto(item, allDbPhotos[item.filePath], context, eventMap, eventById)
                     }
-                }
-            } catch (e: Exception) { }
+                }.awaitAll()
+            }.filterNotNull()
 
-            if (extractedDate != null) {
-                photoDate = extractedDate!!
-            }
+            val toInsert = results.filter { it.id == 0L }
+            val toUpdate = results.filter { it.id != 0L }
+            val insertedIds = if (toInsert.isNotEmpty()) photoDao.insertPhotos(toInsert) else emptyList()
+            if (toUpdate.isNotEmpty()) photoDao.updatePhotos(toUpdate)
 
-            // Mapから高速に検索
-            val matchingEventId = eventMap[photoDate]?.firstOrNull()?.id
+            // 現場が新たに紐づいた・変わった写真へアーティストを自動付与
+            val eventChangedIds = toUpdate
+                .filter { it.eventId != allDbPhotos[it.filePath]?.eventId }
+                .map { it.id }
+            autoAssignArtists(insertedIds + eventChangedIds)
+        }
+    }
 
-            if (existing == null) {
-                toInsert.add(PhotoEntity(
-                    filePath = path, 
-                    fileType = item.fileType, 
-                    status = PhotoStatus.SHOT.name, 
-                    eventId = matchingEventId,
-                    iso = extractedIso,
-                    focalLength = extractedFocal,
-                    aperture = extractedAperture,
-                    shutterSpeed = extractedSs,
-                    cameraMake = extractedMake,
-                    dateAdded = item.dateAdded,
-                    dateTaken = item.dateTaken,
-                    dateModified = item.dateModified
-                ))
-            } else {
-                // 撮影日と現場の日付が一致しているか厳格にチェック
-                val currentEvent = allEvents.find { it.id == existing.eventId }
-                val currentEventDate = currentEvent?.eventDate?.trim()?.replace("/", "-")
-                
-                val finalEventId = if (currentEventDate != null && currentEventDate != photoDate) {
-                    matchingEventId
-                } else {
-                    existing.eventId ?: matchingEventId
-                }
+    /**
+     * 1枚分の登録/更新内容を作る。変更がなければnull。
+     */
+    private fun buildRegisteredPhoto(
+        item: LocalPhotoItem,
+        existing: PhotoEntity?,
+        context: Context,
+        eventMap: Map<String, List<EventEntity>>,
+        eventById: Map<Long, EventEntity>
+    ): PhotoEntity? {
+        val path = item.filePath
 
-                val updated = existing.copy(
-                    eventId = finalEventId,
-                    iso = existing.iso ?: extractedIso,
-                    focalLength = existing.focalLength ?: extractedFocal,
-                    aperture = existing.aperture ?: extractedAperture,
-                    shutterSpeed = existing.shutterSpeed ?: extractedSs,
-                    cameraMake = existing.cameraMake ?: extractedMake,
-                    dateAdded = if (existing.dateAdded == 0L) item.dateAdded else existing.dateAdded,
-                    dateTaken = existing.dateTaken ?: item.dateTaken,
-                    dateModified = existing.dateModified ?: item.dateModified
-                )
-                if (updated != existing) {
-                    toUpdate.add(updated)
-                    if (updated.eventId != existing.eventId) eventChangedIds.add(existing.id)
-                }
-            }
+        // 既に必要な情報が揃っている場合はスキップ（大幅な高速化）
+        if (existing != null && existing.iso != null && existing.cameraMake != null &&
+            existing.eventId != null && existing.dateAdded != 0L) {
+            return null
         }
 
-        // まとめて書き込み（DBアクセスの劇的な削減）
-        val insertedIds = if (toInsert.isNotEmpty()) photoDao.insertPhotos(toInsert) else emptyList()
-        if (toUpdate.isNotEmpty()) photoDao.updatePhotos(toUpdate)
+        // この処理で一度解析済みの写真（dateTakenが設定済み）は、EXIFを読み直さない。
+        // EXIFが無い写真（スクショ等）や現場未設定の写真を、起動のたびに毎回読み直していたのを防ぐ。
+        // 現場が未設定なら、MediaStoreの日付で現場の自動紐付けだけ試みる。
+        if (existing != null && existing.dateTaken != null && existing.dateAdded != 0L) {
+            if (existing.eventId != null) return null
+            val matchingEventId = eventMap[item.dateStr.replace("/", "-")]?.firstOrNull()?.id ?: return null
+            return existing.copy(eventId = matchingEventId)
+        }
 
-        // イベントに紐づいた写真へアーティストを自動付与
-        autoAssignArtists(insertedIds + eventChangedIds)
+        var photoDate = item.dateStr.replace("/", "-")
+
+        // EXIF情報の抽出
+        var extractedIso: Int? = null
+        var extractedFocal: Double? = null
+        var extractedAperture: Double? = null
+        var extractedSs: Double? = null
+        var extractedMake: String? = null
+        var extractedDate: String? = null
+
+        try {
+            context.contentResolver.openInputStream(item.uri)?.use { inputStream ->
+                val exif = ExifInterface(inputStream)
+                extractedIso = exif.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, -1)
+                    .let { if (it == -1) exif.getAttributeInt(ExifInterface.TAG_ISO_SPEED, -1) else it }
+                    .let { if (it == -1) null else it }
+
+                extractedFocal = exif.getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, -1)
+                    .let { if (it == -1) null else it.toDouble() }
+
+                extractedAperture = exif.getAttributeDouble(ExifInterface.TAG_F_NUMBER, -1.0)
+                    .let { if (it <= 0) null else it }
+
+                extractedSs = exif.getAttributeDouble(ExifInterface.TAG_EXPOSURE_TIME, -1.0)
+                    .let { if (it <= 0) null else it }
+
+                extractedMake = (exif.getAttribute(ExifInterface.TAG_MAKE) ?: exif.getAttribute(ExifInterface.TAG_MODEL))?.trim()
+
+                val exifDate = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                    ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+                if (exifDate != null) {
+                    extractedDate = exifDate.substringBefore(" ").replace(":", "-")
+                }
+            }
+        } catch (e: Exception) { }
+
+        extractedDate?.let { photoDate = it }
+
+        // Mapから高速に検索
+        val matchingEventId = eventMap[photoDate]?.firstOrNull()?.id
+
+        if (existing == null) {
+            return PhotoEntity(
+                filePath = path,
+                fileType = item.fileType,
+                status = PhotoStatus.SHOT.name,
+                eventId = matchingEventId,
+                iso = extractedIso,
+                focalLength = extractedFocal,
+                aperture = extractedAperture,
+                shutterSpeed = extractedSs,
+                cameraMake = extractedMake,
+                dateAdded = item.dateAdded,
+                dateTaken = item.dateTaken,
+                dateModified = item.dateModified
+            )
+        }
+
+        // 撮影日と現場の日付が一致しているか厳格にチェック
+        val currentEventDate = existing.eventId?.let { eventById[it] }?.eventDate?.trim()?.replace("/", "-")
+        val finalEventId = if (currentEventDate != null && currentEventDate != photoDate) {
+            matchingEventId
+        } else {
+            existing.eventId ?: matchingEventId
+        }
+
+        val updated = existing.copy(
+            eventId = finalEventId,
+            iso = existing.iso ?: extractedIso,
+            focalLength = existing.focalLength ?: extractedFocal,
+            aperture = existing.aperture ?: extractedAperture,
+            shutterSpeed = existing.shutterSpeed ?: extractedSs,
+            cameraMake = existing.cameraMake ?: extractedMake,
+            dateAdded = if (existing.dateAdded == 0L) item.dateAdded else existing.dateAdded,
+            dateTaken = existing.dateTaken ?: item.dateTaken,
+            dateModified = existing.dateModified ?: item.dateModified
+        )
+        return if (updated != existing) updated else null
     }
 
     /**
@@ -1279,20 +1304,14 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                 val lastScanTime = prefs.getLong("last_scan_time", 0L)
                 var maxDateAdded = lastScanTime
 
-                // 起動時はUI表示を最優先
-                val allPhotos = mutableListOf<LocalPhotoItem>()
-                loadPhotosWithMimeStreaming(context) { batch ->
-                    allPhotos.addAll(batch)
-                    viewModel.localPhotos = allPhotos.toList()
-                    
-                    // 最初の1バッチ（100枚）が出たら、ユーザーが待たされている感を減らすためにバーを早めに消す検討
-                    if (allPhotos.size >= 100) {
-                        viewModel.isRefreshing = false 
-                    }
-                    
-                    batch.forEach { if (it.dateAdded > maxDateAdded) maxDateAdded = it.dateAdded }
-                }
-                
+                // 起動時はUI表示を最優先。
+                // グリッドはDB(Paging)から表示するので、端末写真の一覧はバックグラウンドで一括取得する。
+                // 100枚ごとにメインスレッドへ書き戻すと、その間グリッドの初回描画が遅れるため。
+                val allPhotos = loadPhotosWithMimeAsync(context)
+                viewModel.localPhotos = allPhotos
+                viewModel.isRefreshing = false
+                allPhotos.forEach { if (it.dateAdded > maxDateAdded) maxDateAdded = it.dateAdded }
+
                 // 全件ロード完了後にバックグラウンドで解析
                 scope.launch(Dispatchers.IO) {
                     viewModel.registerPhotosWithAutoEvent(allPhotos, context, lastScanTime)
@@ -3215,9 +3234,9 @@ fun ModernPhotoItem(
     val lightweightLoader = remember { getLightweightImageLoader(context) }
 
     // 解像度を320pxに制限し、キャッシュの再利用を優先
-    val imageRequest = remember(item.uri) {
+    val imageRequest = remember(item.filePath) {
         ImageRequest.Builder(context)
-            .data(item.uri)
+            .data(MediaThumb(item.filePath)) // OSのサムネイルを利用して高速表示
             .size(320)
             .precision(Precision.INEXACT)
             .build()
@@ -3865,11 +3884,10 @@ fun GroupedHistoryItem(
 @Composable
 fun HistorySmallThumbnail(filePath: String) {
     val context = LocalContext.current
-    val uri = Uri.parse(filePath)
     val lightweightLoader = remember { getLightweightImageLoader(context) }
-    val imageRequest = remember(uri) {
+    val imageRequest = remember(filePath) {
         ImageRequest.Builder(context)
-            .data(uri)
+            .data(MediaThumb(filePath))
             .size(100, 100)
             .build()
     }
@@ -3906,11 +3924,10 @@ fun HistoryThumbnailItem(history: StatusHistoryEntity, sdfFull: SimpleDateFormat
         } catch (e: Exception) { }
         name
     }
-    val uri = Uri.parse(history.photoFilePath)
     val lightweightLoader = remember { getLightweightImageLoader(context) }
-    val imageRequest = remember(uri) {
+    val imageRequest = remember(history.photoFilePath) {
         ImageRequest.Builder(context)
-            .data(uri)
+            .data(MediaThumb(history.photoFilePath))
             .crossfade(true)
             .size(120, 120)
             .build()
@@ -4127,80 +4144,6 @@ suspend fun loadPhotosWithMimeAsync(context: Context): List<LocalPhotoItem> = wi
     return@withContext items.distinctBy { it.uri.toString() }
 }
 
-suspend fun loadPhotosWithMimeStreaming(
-    context: Context,
-    onBatch: suspend (List<LocalPhotoItem>) -> Unit
-) = withContext(Dispatchers.IO) {
-    val baseProjection = arrayOf(
-        MediaStore.Images.Media._ID,
-        MediaStore.Images.Media.MIME_TYPE,
-        MediaStore.Images.Media.DATE_TAKEN,
-        MediaStore.Images.Media.DATE_ADDED,
-        MediaStore.Images.Media.DATE_MODIFIED,
-        MediaStore.Images.Media.DATA
-    )
-
-    val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
-    val uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-
-    context.contentResolver.query(uri, baseProjection, null, null, sortOrder)?.use { c ->
-        val idCol = c.getColumnIndex(MediaStore.Images.Media._ID)
-        val mimeCol = c.getColumnIndex(MediaStore.Images.Media.MIME_TYPE)
-        val takenCol = c.getColumnIndex(MediaStore.Images.Media.DATE_TAKEN)
-        val addedCol = c.getColumnIndex(MediaStore.Images.Media.DATE_ADDED)
-        val modCol = c.getColumnIndex(MediaStore.Images.Media.DATE_MODIFIED)
-        val dataCol = c.getColumnIndex(MediaStore.Images.Media.DATA)
-
-        val batch = mutableListOf<LocalPhotoItem>()
-        while (c.moveToNext()) {
-            try {
-                val id = if (idCol != -1) c.getLong(idCol) else continue
-                val mimeType = if (mimeCol != -1) (c.getString(mimeCol) ?: "").lowercase() else ""
-                val dataPath = if (dataCol != -1) (c.getString(dataCol) ?: "") else ""
-
-                val realDateTaken = if (takenCol != -1) c.getLong(takenCol) else 0L
-                val dateAdded = if (addedCol != -1) c.getLong(addedCol) * 1000L else 0L
-                val dateModified = if (modCol != -1) c.getLong(modCol) else 0L
-                val photoUri = Uri.withAppendedPath(uri, id.toString())
-
-                val isRaw = mimeType.contains("raw") ||
-                        mimeType.contains("x-adobe-dng") ||
-                        mimeType.contains("image/x-nikon-nef") ||
-                        dataPath.endsWith(".nef", ignoreCase = true) ||
-                        dataPath.endsWith(".cr2", ignoreCase = true) ||
-                        dataPath.endsWith(".cr3", ignoreCase = true) ||
-                        dataPath.endsWith(".arw", ignoreCase = true) ||
-                        dataPath.endsWith(".dng", ignoreCase = true)
-
-                val dateStr = extractDateFromPath(dataPath, realDateTaken, dateModified, dateAdded)
-
-                batch.add(
-                    LocalPhotoItem(
-                        uri = photoUri,
-                        filePath = dataPath.ifBlank { photoUri.toString() },
-                        fileType = if (isRaw) "RAW" else "JPEG",
-                        dateTaken = realDateTaken,
-                        dateModified = dateModified,
-                        dateAdded = dateAdded,
-                        dateStr = dateStr,
-                        cameraMake = null
-                    )
-                )
-
-                if (batch.size >= 100) {
-                    val snapshot = batch.toList()
-                    withContext(Dispatchers.Main) { onBatch(snapshot) }
-                    batch.clear()
-                }
-            } catch (e: Exception) { }
-        }
-        if (batch.isNotEmpty()) {
-            val snapshot = batch.toList()
-            withContext(Dispatchers.Main) { onBatch(snapshot) }
-        }
-    }
-}
-
 // 日付抽出 (撮影日時 > ファイル名 > 編集日時 > 追加日時)
 fun extractDateFromPath(path: String, dateTaken: Long, dateModified: Long, dateAdded: Long): String {
     val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
@@ -4253,6 +4196,11 @@ fun getLightweightImageLoader(context: Context): ImageLoader {
                 .directory(context.applicationContext.cacheDir.resolve("image_cache"))
                 .maxSizePercent(0.1) // ディスクキャッシュを10%に設定
                 .build()
+        }
+        .components {
+            // MediaStoreのサムネイルを使うFetcher（元画像のフルデコードを回避）
+            add(MediaThumbKeyer())
+            add(MediaThumbFetcher.Factory())
         }
         .crossfade(false) // フェードをオフ
         .build().also { _lightweightImageLoader = it }
