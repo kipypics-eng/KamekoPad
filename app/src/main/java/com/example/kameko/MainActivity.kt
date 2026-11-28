@@ -271,6 +271,7 @@ class PhotoViewModel(
     val photoDao: PhotoDao,
     val eventDao: EventDao,
     val historyDao: StatusHistoryDao,
+    val artistDao: ArtistDao,
     val savedStateHandle: SavedStateHandle
 ) : ViewModel() {
 
@@ -305,7 +306,23 @@ class PhotoViewModel(
     private var _selectedEventFilterId by mutableStateOf(savedStateHandle.get<Long?>("selected_event_filter_id"))
     var selectedEventFilterId: Long?
         get() = _selectedEventFilterId
-        set(value) { _selectedEventFilterId = value; savedStateHandle["selected_event_filter_id"] = value }
+        set(value) {
+            _selectedEventFilterId = value
+            savedStateHandle["selected_event_filter_id"] = value
+            // 選択中のアーティストがその現場の出演者でなければ、アーティスト絞り込みを解除する
+            val artistId = _selectedArtistFilterId
+            if (value != null && artistId != null && artistId != ARTIST_FILTER_UNASSIGNED &&
+                artistId !in eventArtists.value[value].orEmpty()
+            ) {
+                selectedArtistFilterId = null
+            }
+        }
+
+    // アーティストフィルタの保持（null=すべて, ARTIST_FILTER_UNASSIGNED=未設定）
+    private var _selectedArtistFilterId by mutableStateOf(savedStateHandle.get<Long?>("selected_artist_filter_id"))
+    var selectedArtistFilterId: Long?
+        get() = _selectedArtistFilterId
+        set(value) { _selectedArtistFilterId = value; savedStateHandle["selected_artist_filter_id"] = value }
 
     // 機材フィルタの保持
     private var _selectedMakeFilter by mutableStateOf(savedStateHandle.get<String?>("selected_make_filter"))
@@ -483,6 +500,66 @@ class PhotoViewModel(
         viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
     )
 
+    // ---- アーティスト ----
+    // エクスポートや候補表示で同期的に参照するため、画面の購読に関係なく常に保持する（件数は小さい）
+    val allArtists = artistDao.getAllArtists().stateIn(
+        viewModelScope, SharingStarted.Eagerly, emptyList()
+    )
+
+    /** eventId → 出演者の artistId 一覧 */
+    val eventArtists = artistDao.getAllEventArtists()
+        .map { refs -> refs.groupBy({ it.eventId }, { it.artistId }) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
+    /** ギャラリーのアーティスト絞り込み候補（イベント絞り込み中はその出演者のみ） */
+    val artistFilterOptions = snapshotFlow { selectedEventFilterId }
+        .flatMapLatest { artistDao.getArtistsWithPhotoCount(it) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun eventArtistNames(eventId: Long): List<String> {
+        val namesById = allArtists.value.associate { it.id to it.name }
+        return eventArtists.value[eventId].orEmpty().mapNotNull { namesById[it] }.sortedBy { it.lowercase() }
+    }
+
+    fun photoArtists(photoId: Long) = artistDao.getArtistsForPhoto(photoId)
+
+    fun photoArtistRefs(photoIds: List<Long>) = artistDao.getPhotoArtistsFlow(photoIds)
+
+    fun addArtistToPhotos(photoIds: List<Long>, name: String) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty() || photoIds.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val artistId = artistDao.getOrCreateArtistId(trimmed)
+            artistDao.insertPhotoArtists(photoIds.map { PhotoArtistCrossRef(it, artistId) })
+        }
+    }
+
+    fun removeArtistFromPhotos(photoIds: List<Long>, artistId: Long) {
+        if (photoIds.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            artistDao.removeArtistFromPhotos(photoIds, artistId)
+        }
+    }
+
+    fun renameArtist(id: Long, newName: String, onResult: (Boolean) -> Unit) {
+        val trimmed = newName.trim()
+        if (trimmed.isEmpty()) { onResult(false); return }
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = artistDao.renameArtist(id, trimmed) > 0
+            withContext(Dispatchers.Main) { onResult(updated) }
+        }
+    }
+
+    fun deleteArtist(id: Long) {
+        if (selectedArtistFilterId == id) selectedArtistFilterId = null
+        viewModelScope.launch(Dispatchers.IO) { artistDao.deleteArtist(id) }
+    }
+
+    /** 出演者が1組だけのイベントに紐づいた写真へ自動付与（SQLite の変数上限を避けて分割） */
+    private suspend fun autoAssignArtists(photoIds: Collection<Long>) {
+        photoIds.filter { it > 0 }.distinct().chunked(500).forEach { artistDao.autoAssignSingleArtist(it) }
+    }
+
     val availableBodies = photoDao.getUniqueMakes().stateIn(
         viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
     )
@@ -502,21 +579,23 @@ class PhotoViewModel(
 
     // Paging 3による写真リスト
     val pagedPhotos = snapshotFlow {
-        Quadruple(selectedStatusFilter, selectedTypeFilter, selectedEventFilterId, selectedMakeFilter) to selectedSortType
-    }.flatMapLatest { (filters, sortType) ->
-        val (status, type, eventId, make) = filters
+        GalleryQuery(selectedStatusFilter, selectedTypeFilter, selectedEventFilterId, selectedMakeFilter, selectedArtistFilterId, selectedSortType)
+    }.flatMapLatest { q ->
         Pager(
             config = PagingConfig(pageSize = 50, prefetchDistance = 100, enablePlaceholders = true),
-            pagingSourceFactory = { photoDao.getFilteredPhotosPaging(status, type, eventId, make, sortType.name) }
+            pagingSourceFactory = { photoDao.getFilteredPhotosPaging(q.status, q.type, q.eventId, q.make, q.artistId, q.sortType.name) }
         ).flow
     }.cachedIn(viewModelScope)
 
-data class Quadruple<out A, out B, out C, out D>(
-    val first: A,
-    val second: B,
-    val third: C,
-    val fourth: D
+private data class GalleryQuery(
+    val status: String,
+    val type: String,
+    val eventId: Long?,
+    val make: String?,
+    val artistId: Long?,
+    val sortType: PhotoSortType
 )
+
 
     fun updatePhotoDetails(photo: PhotoEntity, groupId: Long = 0) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -525,8 +604,10 @@ data class Quadruple<out A, out B, out C, out D>(
 
             if (existing != null) {
                 photoDao.updatePhoto(photo.copy(id = existing.id))
+                if (existing.eventId != photo.eventId) autoAssignArtists(listOf(existing.id))
             } else {
-                photoDao.insertPhoto(photo)
+                val newId = photoDao.insertPhoto(photo)
+                autoAssignArtists(listOf(newId))
             }
 
             if (oldStatus != photo.status) {
@@ -575,8 +656,14 @@ data class Quadruple<out A, out B, out C, out D>(
 
             val toInsert = results.filter { it.id == 0L }
             val toUpdate = results.filter { it.id != 0L }
-            if (toInsert.isNotEmpty()) photoDao.insertPhotos(toInsert)
+            val insertedIds = if (toInsert.isNotEmpty()) photoDao.insertPhotos(toInsert) else emptyList()
             if (toUpdate.isNotEmpty()) photoDao.updatePhotos(toUpdate)
+
+            // 現場が新たに紐づいた・変わった写真へアーティストを自動付与
+            val eventChangedIds = toUpdate
+                .filter { it.eventId != allDbPhotos[it.filePath]?.eventId }
+                .map { it.id }
+            autoAssignArtists(insertedIds + eventChangedIds)
         }
     }
 
@@ -687,11 +774,25 @@ data class Quadruple<out A, out B, out C, out D>(
         return if (updated != existing) updated else null
     }
 
-    fun addEvent(event: EventEntity, currentPhotos: List<LocalPhotoItem>) {
+    /**
+     * @param artistNames 出演者。null の場合は出演者を変更しない
+     */
+    fun addEvent(event: EventEntity, currentPhotos: List<LocalPhotoItem>, artistNames: List<String>? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             // 重複チェック
             val existing = eventDao.findEvent(event.name, event.venue, event.eventDate)
-            val eventId = existing?.id ?: eventDao.insert(event)
+            val eventId = when {
+                existing != null -> existing.id
+                event.id != 0L -> { eventDao.update(event); event.id }
+                else -> eventDao.insert(event)
+            }
+
+            if (artistNames != null) {
+                val artistIds = artistNames.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+                    .map { artistDao.getOrCreateArtistId(it) }
+                artistDao.setEventArtists(eventId, artistIds)
+                artistDao.autoAssignSingleArtistForEvent(eventId)
+            }
 
             if (event.startTime <= 0L) return@launch
 
@@ -711,6 +812,7 @@ data class Quadruple<out A, out B, out C, out D>(
                     }
                 }
             }
+            artistDao.autoAssignSingleArtistForEvent(eventId)
         }
     }
 
@@ -729,13 +831,24 @@ data class Quadruple<out A, out B, out C, out D>(
                     val name = lines[0]
                     val venue = lines[1]
                     val dateStr = lines[2]
-                    
+                    // 4行目以降は出演者（1行に1組）
+                    val artistNames = lines.drop(3).distinct()
+
                     // 重複チェック
                     val existing = eventDao.findEvent(name, venue, dateStr)
-                    if (existing == null) {
+                    val eventId = if (existing == null) {
                         val startTimeTimestamp = try { sdf.parse(dateStr)?.time ?: 0L } catch (e: Exception) { 0L }
-                        eventDao.insert(EventEntity(id = 0, name = name, venue = venue, eventDate = dateStr, startTime = startTimeTimestamp, endTime = 0L))
                         count++
+                        eventDao.insert(EventEntity(id = 0, name = name, venue = venue, eventDate = dateStr, startTime = startTimeTimestamp, endTime = 0L))
+                    } else {
+                        existing.id
+                    }
+
+                    // 出演者は追加のみ（既存の出演者は消さない）
+                    if (artistNames.isNotEmpty()) {
+                        val artistIds = artistNames.map { artistDao.getOrCreateArtistId(it) }
+                        artistDao.insertEventArtists(artistIds.map { EventArtistCrossRef(eventId, it) })
+                        artistDao.autoAssignSingleArtistForEvent(eventId)
                     }
                 }
             }
@@ -780,7 +893,7 @@ data class Quadruple<out A, out B, out C, out D>(
     fun exportEventsToText(): String {
         val allEvents = events.value.sortedByDescending { it.startTime }
         return allEvents.joinToString("\n\n") { event ->
-            "${event.name}\n${event.venue}\n${event.eventDate}"
+            (listOf(event.name, event.venue, event.eventDate) + eventArtistNames(event.id)).joinToString("\n")
         }
     }
 
@@ -896,18 +1009,21 @@ data class Quadruple<out A, out B, out C, out D>(
 
     fun assignEventToPhotos(uris: Set<Uri>, eventId: Long?) {
         viewModelScope.launch(Dispatchers.IO) {
-            val allDbPhotos = photoDao.getAllPhotosOnce().associateBy { it.filePath }
+            val dbPhotos = photoDao.getAllPhotosOnce()
+            val allDbPhotos = dbPhotos.associateBy { it.filePath }
+            // ギャラリー（Paging）の選択URIは filePath から作った URI なので、それでも引けるようにする
+            val dbPhotosByUri = dbPhotos.associateBy { photoDisplayUri(it.filePath) }
             val toUpdate = mutableListOf<PhotoEntity>()
             val toInsert = mutableListOf<PhotoEntity>()
 
             uris.forEach { uri ->
-                val local = localPhotos.find { it.uri == uri } ?: return@forEach
-                val existing = allDbPhotos[local.filePath]
+                val local = localPhotos.find { it.uri == uri }
+                val existing = local?.let { allDbPhotos[it.filePath] } ?: dbPhotosByUri[uri]
                 if (existing != null) {
                     if (existing.eventId != eventId) {
                         toUpdate.add(existing.copy(eventId = eventId))
                     }
-                } else {
+                } else if (local != null) {
                     toInsert.add(
                         PhotoEntity(
                             filePath = local.filePath,
@@ -920,15 +1036,21 @@ data class Quadruple<out A, out B, out C, out D>(
             }
 
             if (toUpdate.isNotEmpty()) photoDao.updatePhotos(toUpdate)
-            if (toInsert.isNotEmpty()) photoDao.insertPhotos(toInsert)
+            val insertedIds = if (toInsert.isNotEmpty()) photoDao.insertPhotos(toInsert) else emptyList()
+            if (eventId != null) autoAssignArtists(toUpdate.map { it.id } + insertedIds)
         }
     }
 }
+
+/** ギャラリー表示用の URI（PhotoEntity.filePath から生成） */
+fun photoDisplayUri(filePath: String): Uri =
+    Uri.parse(if (filePath.startsWith("/")) "file://$filePath" else filePath)
 
 class PhotoViewModelFactory(
     private val photoDao: PhotoDao,
     private val eventDao: EventDao,
     private val historyDao: StatusHistoryDao,
+    private val artistDao: ArtistDao,
     owner: SavedStateRegistryOwner,
     defaultArgs: Bundle? = null
 ) : AbstractSavedStateViewModelFactory(owner, defaultArgs) {
@@ -938,7 +1060,7 @@ class PhotoViewModelFactory(
         modelClass: Class<T>,
         handle: SavedStateHandle
     ): T {
-        return PhotoViewModel(photoDao, eventDao, historyDao, handle) as T
+        return PhotoViewModel(photoDao, eventDao, historyDao, artistDao, handle) as T
     }
 }
 
@@ -960,6 +1082,7 @@ class MainActivity : ComponentActivity() {
                 db.photoDao(),
                 db.eventDao(),
                 db.statusHistoryDao(),
+                db.artistDao(),
                 this
             )
             val viewModel: PhotoViewModel = viewModel(factory = factory)
@@ -977,6 +1100,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
     val photoDao = viewModel.photoDao
     val photos by viewModel.photos.collectAsState()
     val dbEvents by viewModel.events.collectAsState()
+    val allArtists by viewModel.allArtists.collectAsState()
     var currentTab by remember { mutableIntStateOf(0) } // 0: Gallery, 1: Timeline, 2: Stats, 3: Setting
 
     // 機材選択モード中かどうかのラベル
@@ -1002,6 +1126,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
     var selectedPhotoIndex by remember { mutableStateOf<Int?>(null) }
     var selectedUris by remember { mutableStateOf(setOf<Uri>()) } // 複数選択用
     var showMultiEventAssignDialog by remember { mutableStateOf(false) }
+    var showMultiArtistAssignDialog by remember { mutableStateOf(false) }
 
     // 追加：OSによってViewModelが初期化された場合でも、DBから写真が読み込まれた瞬間に未確認リストを復元する
     LaunchedEffect(photos) {
@@ -1282,7 +1407,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
     // UI表示用の変換（Pagingから取得したPhotoEntityをLocalPhotoItemに見せかける）
     fun PhotoEntity.toLocalPhotoItem(context: Context): LocalPhotoItem {
         return LocalPhotoItem(
-            uri = Uri.parse(this.filePath.let { if (it.startsWith("/")) "file://$it" else it }),
+            uri = photoDisplayUri(this.filePath),
             filePath = this.filePath,
             fileType = this.fileType,
             dateTaken = 0L,
@@ -1321,6 +1446,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
     var newEventName by remember { mutableStateOf("") }
     var newEventVenue by remember { mutableStateOf("") }
     var newEventDate by remember { mutableStateOf("2001-07-09") }
+    var newEventArtists by remember { mutableStateOf(listOf<String>()) }
 
     var editingEvent by remember { mutableStateOf<EventEntity?>(null) }
 
@@ -1363,6 +1489,11 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                             icon = Icons.Default.Place,
                             label = "現場設定",
                             onClick = { showMultiEventAssignDialog = true }
+                        )
+                        SelectionActionButton(
+                            icon = Icons.Default.Person,
+                            label = "アーティスト",
+                            onClick = { showMultiArtistAssignDialog = true }
                         )
                         SelectionActionButton(
                             icon = Icons.Default.CheckCircle,
@@ -1441,6 +1572,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                         newEventName = event.name
                         newEventVenue = event.venue
                         newEventDate = event.eventDate
+                        newEventArtists = viewModel.eventArtistNames(event.id)
                         showEventDialog = true
                     }
                 )
@@ -1959,6 +2091,9 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                     }
                                 }
 
+                                // アーティスト選択
+                                ArtistFilterDropdown(viewModel = viewModel, modifier = Modifier.weight(0.7f))
+
                                 // 現場追加ボタン
                                 AssistChip(
                                     onClick = { showEventDialog = true },
@@ -2117,16 +2252,31 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
         )
     }
 
+    if (showMultiArtistAssignDialog) {
+        val selectedPhotos = remember(selectedUris, photos) {
+            photos.filter { photoDisplayUri(it.filePath) in selectedUris }
+        }
+        MultiArtistAssignDialog(
+            viewModel = viewModel,
+            photos = selectedPhotos,
+            onDismiss = { showMultiArtistAssignDialog = false }
+        )
+    }
+
     // --- 現場登録ダイアログ ---
     if (showEventDialog) {
         AlertDialog(
-            onDismissRequest = { 
+            onDismissRequest = {
                 showEventDialog = false
                 editingEvent = null
+                newEventArtists = emptyList()
             },
             title = { Text(if (isBulkInsertMode) "現場一括登録" else if (editingEvent != null) "現場編集" else "現場登録", fontWeight = FontWeight.Bold) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
                     // 新規登録時のみ一括モードを許可
                     if (editingEvent == null) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2141,7 +2291,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                     
                     if (isBulkInsertMode && editingEvent == null) {
                         Text(
-                            text = "【記載例】\nイベント名\n会場名\n2024-04-18\n\n※空行区切りで複数登録できます",
+                            text = "【記載例】\nイベント名\n会場名\n2024-04-18\n出演者A\n出演者B\n\n※4行目以降は出演者（1行に1組・省略可）\n※空行区切りで複数登録できます",
                             fontSize = 12.sp,
                             color = Color.Gray,
                             lineHeight = 16.sp
@@ -2171,6 +2321,17 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                             label = { Text("日付 (yyyy-MM-dd)") },
                             modifier = Modifier.fillMaxWidth()
                         )
+                        Text("出演者", fontSize = 12.sp, color = Color.Gray, fontWeight = FontWeight.Bold)
+                        ArtistChipEditor(
+                            selected = newEventArtists,
+                            suggestions = allArtists.map { it.name },
+                            onAdd = { name ->
+                                if (newEventArtists.none { it.equals(name, ignoreCase = true) }) {
+                                    newEventArtists = newEventArtists + name
+                                }
+                            },
+                            onRemove = { name -> newEventArtists = newEventArtists - name }
+                        )
                     }
                 }
             },
@@ -2189,20 +2350,23 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
                                 eventDate = newEventDate, 
                                 startTime = ts
                             ),
-                            viewModel.localPhotos
+                            viewModel.localPhotos,
+                            artistNames = newEventArtists
                         )
                     }
                     showEventDialog = false
                     editingEvent = null
                     newEventName = ""; newEventVenue = ""; bulkInputText = ""
+                    newEventArtists = emptyList()
                 }) {
                     Text(if (editingEvent != null) "更新" else "登録")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { 
+                TextButton(onClick = {
                     showEventDialog = false
                     editingEvent = null
+                    newEventArtists = emptyList()
                 }) { Text("キャンセル") }
             }
         )
@@ -2222,6 +2386,7 @@ fun PhotoListScreen(viewModel: PhotoViewModel) {
             pagedPhotos = pagedPhotos,
             initialIndex = index,
             events = dbEvents,
+            viewModel = viewModel,
             onDismiss = { selectedPhotoIndex = null },
             onSaveStatus = { photoEntity, status, eventId, memo ->
                 viewModel.updatePhotoDetails(photoEntity.copy(status = status, eventId = eventId, memo = memo))
@@ -2647,6 +2812,11 @@ fun ModernSettingScreen(
 ) {
     val context = LocalContext.current
     var showResetConfirm by remember { mutableStateOf(false) }
+    var showArtistManage by remember { mutableStateOf(false) }
+
+    if (showArtistManage) {
+        ArtistManageDialog(viewModel = viewModel, onDismiss = { showArtistManage = false })
+    }
 
     if (showResetConfirm) {
         AlertDialog(
@@ -2899,6 +3069,30 @@ fun ModernSettingScreen(
                     Icon(Icons.AutoMirrored.Filled.List, null, tint = MaterialTheme.colorScheme.onSurface)
                     Spacer(Modifier.width(16.dp))
                     Text("現場（イベント）の管理・一括登録", fontSize = 15.sp)
+                }
+                Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.Gray)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { showArtistManage = true },
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(16.dp),
+            tonalElevation = 2.dp
+        ) {
+            Row(
+                modifier = Modifier.padding(20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Person, null, tint = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.width(16.dp))
+                    Text("アーティストの管理", fontSize = 15.sp)
                 }
                 Icon(Icons.Default.KeyboardArrowRight, null, tint = Color.Gray)
             }
@@ -3225,6 +3419,7 @@ fun PhotoDetailViewPaged(
     pagedPhotos: androidx.paging.compose.LazyPagingItems<PhotoEntity>,
     initialIndex: Int,
     events: List<EventEntity>,
+    viewModel: PhotoViewModel,
     onDismiss: () -> Unit,
     onSaveStatus: (PhotoEntity, String, Long?, String) -> Unit,
     onShare: (PhotoEntity, LocalPhotoItem, String?) -> Unit
@@ -3611,6 +3806,8 @@ fun PhotoDetailViewPaged(
                         }
                     }
                 }
+
+                PhotoArtistSection(viewModel = viewModel, photo = photoEntity, eventId = selectedEventId)
 
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf("SHOT" to "SHOT", "FAVORITE" to "FAV", "POSTED" to "POST").forEach { (statusKey, label) ->
